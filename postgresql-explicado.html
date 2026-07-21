@@ -496,8 +496,80 @@
 <blockquote><strong>👦 Explicación técnica.</strong> Un <strong>índice</strong> es una estructura auxiliar que encuentra las filas que casan <strong>sin escanear toda la tabla</strong> — cambias más costo de escritura y almacenamiento por lecturas más rápidas. El tipo por defecto es un <strong>B-tree</strong> (igualdad, rangos, <code>ORDER BY</code>); otros sirven para otros trabajos: <strong>GIN</strong> (full-text, <code>JSONB</code>, arrays), <strong>GiST</strong> (geométrico/difuso), <strong>BRIN</strong> (tablas enormes y ordenadas), <strong>Hash</strong> (igualdad). Un índice es solo una <em>posibilidad</em> — el planificador (§7) usa estadísticas para decidir si un <strong>Index Scan</strong> le gana a un <strong>Sequential Scan</strong>. Sobre-indexar frena las escrituras; sub-indexar frena las lecturas.</blockquote>
 
 <h2 id="p1-7">7. El planificador</h2>
-<p>Piensa primero el camino más rápido (usar el índice o leerlo todo) según las <strong>estadísticas</strong>. Es el <strong>query planner</strong>. Lo espías con <code>EXPLAIN</code>.</p>
+<p>Le pides al bibliotecario <em>"tráeme todos los libros de dinosaurios verdes"</em>. Antes de dar un paso, <strong>piensa la mejor ruta</strong>: ¿va directo al <strong>fichero ordenado</strong> (el índice) y salta al estante exacto? ¿O como <em>casi todos</em> los libros son de dinosaurios, mejor <strong>recorre pasillo por pasillo</strong>? Y si le pides <strong>cruzar dos catálogos</strong> ("dinosaurios que además salen en películas"), ¿empareja uno por uno, arma una <strong>tabla de búsqueda</strong>, u <strong>ordena las dos listas</strong> y las cruza en paralelo?</p>
+<p>No adivina: tiene una <strong>libretita de estadísticas</strong> ("pasillo 5 ≈ 3 libros de dinosaurios; pasillo 2 ≈ 40 000 de historia") y con ella <strong>estima el esfuerzo de cada ruta</strong> para elegir la más barata. Esa libreta la mantiene al día el ayudante <code>ANALYZE</code>. Eso es el <strong>query planner / optimizer</strong>; la ruta elegida la espías con <code>EXPLAIN</code>.</p>
 <blockquote><strong>👦 Explicación técnica.</strong> El <strong>query planner/optimizer</strong> es <strong>basado en costos</strong>: para una query hay muchos planes válidos — qué índice, qué <strong>algoritmo de join</strong> (nested loop / hash / merge), en qué orden — y <strong>estima el costo de cada uno</strong> con <strong>estadísticas de tablas</strong> (conteos de filas, distribuciones) que recolecta <code>ANALYZE</code>, y ejecuta el más barato. Inspecciónalo con <strong><code>EXPLAIN</code></strong> (estimado) o <strong><code>EXPLAIN ANALYZE</code></strong> (estimado vs. realidad). La causa #1 de lentitud repentina son las <strong>estadísticas desactualizadas</strong> que llevan a una mala estimación.</blockquote>
+
+<h3 id="p1-7-1">7.1 🔬 El puente: qué hace el planificador por dentro (con el código real)</h3>
+<p>La libreta del bibliotecario es la analogía; ahora abramos la <strong>maquinaria real</strong>. El planner no es magia: es un procedimiento con etapas bien definidas en el fuente de PostgreSQL. Tu SQL primero pasa por el <strong>parser</strong> y el <strong>analyzer/rewriter</strong> (el flujo completo de cuatro etapas está en la Parte 2 §6.6); esto es un acercamiento <strong>dentro</strong> de la caja "PLANNER":</p>
+<svg viewBox="0 0 880 590" class="diagram" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Qué hace el planificador de PostgreSQL por dentro">
+  <defs>
+    <marker id="arrpl" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L7,3 L0,6 z" fill="#475569"/>
+    </marker>
+  </defs>
+  <!-- box 0: query tree -->
+  <rect x="170" y="12" width="540" height="40" rx="9" fill="#f1f5f9" stroke="#94a3b8"/>
+  <text x="440" y="29" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#334155">query tree</text>
+  <text x="440" y="44" text-anchor="middle" font-size="10.5" fill="#64748b">ya validado: tablas, tipos, vistas expandidas</text>
+  <!-- box 1: standard_planner -->
+  <rect x="170" y="68" width="540" height="40" rx="9" fill="#ecfdf5" stroke="#10b981"/>
+  <text x="440" y="85" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#065f46">standard_planner()</text>
+  <text x="440" y="100" text-anchor="middle" font-size="10.5" fill="#047857">planner.c — punto de entrada</text>
+  <!-- box 2: subquery_planner -->
+  <rect x="170" y="124" width="540" height="40" rx="9" fill="#ecfdf5" stroke="#10b981"/>
+  <text x="440" y="141" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#065f46">subquery_planner()</text>
+  <text x="440" y="156" text-anchor="middle" font-size="10.5" fill="#047857">aplana subqueries · simplifica expresiones constantes</text>
+  <!-- box 3: query_planner -->
+  <rect x="170" y="180" width="540" height="40" rx="9" fill="#ecfdf5" stroke="#10b981"/>
+  <text x="440" y="197" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#065f46">query_planner() → make_one_rel()</text>
+  <text x="440" y="212" text-anchor="middle" font-size="10.5" fill="#047857">empieza la búsqueda del mejor camino</text>
+  <!-- box 4: access paths -->
+  <rect x="170" y="236" width="540" height="40" rx="9" fill="#ecfdf5" stroke="#10b981"/>
+  <text x="440" y="253" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#065f46">Genera ACCESS PATHS por tabla</text>
+  <text x="440" y="268" text-anchor="middle" font-size="10.5" fill="#047857">Seq Scan · Index Scan · Bitmap Scan</text>
+  <!-- box 5: join ordering -->
+  <rect x="170" y="292" width="540" height="40" rx="9" fill="#ecfdf5" stroke="#10b981"/>
+  <text x="440" y="309" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#065f46">Ordena los JOINs</text>
+  <text x="440" y="324" text-anchor="middle" font-size="10.5" fill="#047857">&lt; 12 tablas: programación dinámica · ≥ geqo_threshold: GEQO (genético)</text>
+  <!-- box 6: costing (heart) -->
+  <rect x="170" y="348" width="540" height="40" rx="9" fill="#fff8f1" stroke="#eb6608"/>
+  <text x="440" y="365" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#b35309">COSTEA cada camino ❤️ (costsize.c)</text>
+  <text x="440" y="380" text-anchor="middle" font-size="10.5" fill="#b35309">usa pg_class.reltuples + pg_statistic (de ANALYZE)</text>
+  <!-- box 7: cheapest -->
+  <rect x="170" y="404" width="540" height="40" rx="9" fill="#ecfdf5" stroke="#10b981"/>
+  <text x="440" y="421" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#065f46">Elige el camino más BARATO</text>
+  <text x="440" y="436" text-anchor="middle" font-size="10.5" fill="#047857">cheapest_total_path</text>
+  <!-- box 8: create_plan -->
+  <rect x="170" y="460" width="540" height="40" rx="9" fill="#dbeafe" stroke="#2563eb"/>
+  <text x="440" y="477" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#1e3a8a">create_plan()</text>
+  <text x="440" y="492" text-anchor="middle" font-size="10.5" fill="#1e3a8a">convierte el Path ganador en un PLAN TREE</text>
+  <!-- box 9: executor -->
+  <rect x="170" y="516" width="540" height="40" rx="9" fill="#ede9fe" stroke="#7c3aed"/>
+  <text x="440" y="533" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#5b21b6">→ Executor (ExecutorRun)</text>
+  <text x="440" y="548" text-anchor="middle" font-size="10.5" fill="#5b21b6">esto es lo que imprime EXPLAIN</text>
+  <!-- arrows -->
+  <line x1="440" y1="52" x2="440" y2="68" stroke="#475569" marker-end="url(#arrpl)"/>
+  <line x1="440" y1="108" x2="440" y2="124" stroke="#475569" marker-end="url(#arrpl)"/>
+  <line x1="440" y1="164" x2="440" y2="180" stroke="#475569" marker-end="url(#arrpl)"/>
+  <line x1="440" y1="220" x2="440" y2="236" stroke="#475569" marker-end="url(#arrpl)"/>
+  <line x1="440" y1="276" x2="440" y2="292" stroke="#475569" marker-end="url(#arrpl)"/>
+  <line x1="440" y1="332" x2="440" y2="348" stroke="#475569" marker-end="url(#arrpl)"/>
+  <line x1="440" y1="388" x2="440" y2="404" stroke="#475569" marker-end="url(#arrpl)"/>
+  <line x1="440" y1="444" x2="440" y2="460" stroke="#475569" marker-end="url(#arrpl)"/>
+  <line x1="440" y1="500" x2="440" y2="516" stroke="#475569" marker-end="url(#arrpl)"/>
+</svg>
+<p class="dgm-cap">Un acercamiento <em>dentro</em> de la caja PLANNER de la Parte 2 §6.6. El paso <strong>naranja</strong> es el corazón: costear cada camino con las estadísticas de <code>ANALYZE</code>. El <em>plan tree</em> ganador es justo lo que imprime <code>EXPLAIN</code>.</p>
+<ol>
+  <li><strong>Entrada — <code>standard_planner()</code></strong> (<code>src/backend/optimizer/plan/planner.c</code>). Recibe el <em>query tree</em> validado y devuelve un <em>plan tree</em>.</li>
+  <li><strong>Preprocesado — <code>subquery_planner()</code>.</strong> Aplana subconsultas, "inlinea" funciones y simplifica expresiones constantes (<code>2+2</code> → <code>4</code> una vez, no por fila).</li>
+  <li><strong>Caminos de acceso por tabla.</strong> Genera los <strong>paths</strong> posibles (<code>Seq Scan</code>, <code>Index Scan</code>, <code>Bitmap Heap Scan</code>…). Aquí el índice deja de ser <em>posibilidad</em> (§6) y compite.</li>
+  <li><strong>Orden de los joins.</strong> <strong>Programación dinámica</strong> (<code>standard_join_search</code>) para pocas tablas; <strong>algoritmo genético</strong> (<strong>GEQO</strong>) cuando hay más que <code>geqo_threshold</code> (12 por defecto).</li>
+  <li><strong>Costeo — el corazón</strong> (<code>src/backend/optimizer/path/costsize.c</code>). Costo = parámetros (<code>seq_page_cost</code>, <code>random_page_cost</code>, <code>cpu_tuple_cost</code>) × <strong>cardinalidad estimada</strong>, tomada de <code>pg_class.reltuples</code> y <code>pg_statistic</code> — lo que <code>ANALYZE</code> mantiene fresco.</li>
+  <li><strong>Gana el más barato → <code>create_plan()</code>.</strong> Se vuelve un <strong>plan tree</strong> que va al <strong>executor</strong> (<code>ExecutorRun</code>). <strong>Ese árbol es lo que muestra <code>EXPLAIN</code>.</strong></li>
+</ol>
+<p>Así se cierra el círculo con §6 (índices) y §5 (MVCC/VACUUM): <code>ANALYZE</code> (que <code>autovacuum</code> dispara junto al <code>VACUUM</code>) llena la libreta, el planner la lee para costear, y por eso <strong>estadísticas desactualizadas → mala estimación → mal plan → query lenta</strong>. La Parte 2 §2 enseña a leer el plan con <code>EXPLAIN</code>.</p>
+<blockquote>Nota de exactitud: los símbolos (<code>standard_planner</code>, <code>subquery_planner</code>, <code>query_planner</code>/<code>make_one_rel</code>, <code>standard_join_search</code>, <code>create_plan</code>, <code>cost_*</code> en <code>costsize.c</code>) son <strong>internos estándar de PostgreSQL</strong>, incluidos para que los ubiques en el fuente (<a href="https://github.com/postgres/postgres/tree/master/src/backend/optimizer">src/backend/optimizer</a>). Nombres y detalles finos pueden variar según la versión; verifica contra el código y la doc.</blockquote>
 
 <h2 id="p1-8">8. ACID</h2>
 <p>Un grupo de acciones pasa <strong>todo o nada</strong> (una <strong>transacción</strong>): <strong>A</strong>tómico, <strong>C</strong>onsistente, <strong>A</strong>islado (MVCC), <strong>D</strong>urable (WAL).</p>
