@@ -580,6 +580,79 @@
 <p>That closes the loop with §6 (indexes) and §5 (MVCC/VACUUM): <code>ANALYZE</code> (which <code>autovacuum</code> fires alongside <code>VACUUM</code>) fills the notebook, the planner reads it to cost paths, and that's why <strong>stale statistics → bad estimate → bad plan → slow query</strong>. Part 2 §2 teaches you to read the plan with <code>EXPLAIN</code>.</p>
 <blockquote>Accuracy note: the symbols (<code>standard_planner</code>, <code>subquery_planner</code>, <code>query_planner</code>/<code>make_one_rel</code>, <code>standard_join_search</code>, <code>create_plan</code>, <code>cost_*</code> in <code>costsize.c</code>) are <strong>standard PostgreSQL internals</strong>, included so you can locate them in the source (<a href="https://github.com/postgres/postgres/tree/master/src/backend/optimizer">src/backend/optimizer</a>). Exact names and fine details can vary by version; cross-check against the code and the docs.</blockquote>
 
+<h3 id="p1-7-2">7.2 🧪 A hands-on example: watching the planner change its mind</h3>
+<p>The best way to <em>get</em> the planner is to watch it <strong>choose differently for the same table</strong> depending on how many rows it thinks it will touch. We build a table with 1 million rows and 1000 users (≈ 1000 rows per user) and let <code>ANALYZE</code> fill the statistics notebook (<code>pg_statistic</code>):</p>
+<pre>CREATE TABLE events AS
+SELECT g AS id,
+       (g % 1000)      AS user_id,     -- 1000 users, ~1000 rows each
+       repeat('x', 50) AS payload
+FROM generate_series(1, 1000000) g;    -- 1 million rows
+
+CREATE INDEX idx_events_user ON events(user_id);
+ANALYZE events;   -- fills pg_statistic: n_distinct≈1000, histogram, etc.</pre>
+<p><strong>Case A — selective query (few rows) → <code>Index Scan</code> wins.</strong> You ask for a single user: the planner estimates ~1000 out of 1,000,000 (0.1%), so a few random jumps into the index are <strong>cheaper</strong> than reading the whole table:</p>
+<pre>EXPLAIN ANALYZE SELECT * FROM events WHERE user_id = 42;
+--  Index Scan using idx_events_user on events
+--    (cost=0.42..3100 rows=1000 width=58) (actual ... rows=1000 loops=1)
+--    Index Cond: (user_id = 42)             ← used the index</pre>
+<p><strong>Case B — non-selective query (many rows) → <code>Seq Scan</code> wins.</strong> Now you ask for 90% of the table. The index would force ~900,000 random jumps into the <em>heap</em>; reading everything sequentially (cheap <code>seq_page_cost</code>) costs less, so the planner <strong>deliberately drops the index</strong>:</p>
+<pre>EXPLAIN ANALYZE SELECT * FROM events WHERE user_id &lt; 900;
+--  Seq Scan on events
+--    (cost=0.00..21925 rows=900000 width=58) (actual ... rows=900000 loops=1)
+--    Filter: (user_id &lt; 900)                ← ignored the index on purpose</pre>
+<svg viewBox="0 0 880 340" class="diagram" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="How the planner picks Index Scan vs Seq Scan by estimated cardinality">
+  <defs>
+    <marker id="arrpl2" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L7,3 L0,6 z" fill="#475569"/>
+    </marker>
+  </defs>
+  <!-- query -->
+  <rect x="250" y="12" width="380" height="40" rx="9" fill="#f1f5f9" stroke="#94a3b8"/>
+  <text x="440" y="30" text-anchor="middle" font-size="12" font-weight="bold" fill="#334155">SELECT * FROM events WHERE user_id = ?</text>
+  <text x="440" y="45" text-anchor="middle" font-size="10.5" fill="#64748b">the same query shape, two different constants</text>
+  <!-- estimate -->
+  <rect x="250" y="72" width="380" height="44" rx="9" fill="#ecfdf5" stroke="#10b981"/>
+  <text x="440" y="90" text-anchor="middle" font-size="12" font-weight="bold" fill="#065f46">Planner estimates how many rows match</text>
+  <text x="440" y="105" text-anchor="middle" font-size="10.5" fill="#047857">pg_statistic: n_distinct, histogram (from ANALYZE)</text>
+  <!-- diamond -->
+  <polygon points="440,136 540,176 440,216 340,176" fill="#fff8f1" stroke="#eb6608"/>
+  <text x="440" y="181" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#b35309">selective?</text>
+  <!-- index scan branch -->
+  <rect x="40" y="248" width="360" height="72" rx="9" fill="#dbeafe" stroke="#2563eb"/>
+  <text x="220" y="268" text-anchor="middle" font-size="12" font-weight="bold" fill="#1e3a8a">Index Scan wins</text>
+  <text x="220" y="284" text-anchor="middle" font-size="10.5" fill="#1e3a8a">few random jumps (random_page_cost)</text>
+  <text x="220" y="299" text-anchor="middle" font-size="10.5" fill="#1e3a8a">lower total cost → cheapest_total_path</text>
+  <text x="220" y="314" text-anchor="middle" font-size="10.5" font-style="italic" fill="#1e40af">= 42 → ~1000 of 1M (0.1%)</text>
+  <!-- seq scan branch -->
+  <rect x="480" y="248" width="360" height="72" rx="9" fill="#f1f5f9" stroke="#64748b"/>
+  <text x="660" y="268" text-anchor="middle" font-size="12" font-weight="bold" fill="#334155">Seq Scan wins</text>
+  <text x="660" y="284" text-anchor="middle" font-size="10.5" fill="#334155">read whole table sequentially (seq_page_cost)</text>
+  <text x="660" y="299" text-anchor="middle" font-size="10.5" fill="#334155">lower total cost → cheapest_total_path</text>
+  <text x="660" y="314" text-anchor="middle" font-size="10.5" font-style="italic" fill="#475569">&lt; 900 → ~900k of 1M (90%)</text>
+  <!-- arrows -->
+  <line x1="440" y1="52" x2="440" y2="72" stroke="#475569" marker-end="url(#arrpl2)"/>
+  <line x1="440" y1="116" x2="440" y2="136" stroke="#475569" marker-end="url(#arrpl2)"/>
+  <path d="M340,176 L220,176 L220,248" fill="none" stroke="#475569" marker-end="url(#arrpl2)"/>
+  <path d="M540,176 L660,176 L660,248" fill="none" stroke="#475569" marker-end="url(#arrpl2)"/>
+  <text x="270" y="168" text-anchor="middle" font-size="10.5" font-weight="bold" fill="#1e3a8a">yes (few)</text>
+  <text x="612" y="168" text-anchor="middle" font-size="10.5" font-weight="bold" fill="#334155">no (many)</text>
+</svg>
+<p class="dgm-cap">Same index, same table — <strong>the decision is dictated by the estimated cardinality</strong>, not a fixed rule. That's the costing of §7.1 live: <code>cost_index</code> vs <code>cost_seqscan</code>, cheapest wins.</p>
+<p><strong>The stale-statistics trap (the #1 performance bug).</strong> We insert 500,000 new rows for user 42 <strong>without</strong> running <code>ANALYZE</code>. The notebook still says "≈1000 rows", so the planner picks <code>Index Scan</code>… but there are now 501,000 rows: estimate and reality <strong>diverge</strong> — the tell is estimated <code>rows</code> vs actual <code>rows</code>:</p>
+<pre>INSERT INTO events
+SELECT 1000000 + g, 42, repeat('x', 50) FROM generate_series(1, 500000) g;
+
+EXPLAIN ANALYZE SELECT * FROM events WHERE user_id = 42;
+--  Index Scan ...  (cost=... rows=1000 ...) (actual ... rows=501000 loops=1)
+--                              ▲ estimated 1000       ▲ actual 501000   ← 500× off!
+
+ANALYZE events;   -- refresh pg_statistic
+
+EXPLAIN ANALYZE SELECT * FROM events WHERE user_id = 42;
+--  Seq Scan ...    (cost=... rows=501000 ...) (actual ... rows=501000 loops=1)
+--  Now the estimate is right → the planner switches to Seq Scan (the correct plan)</pre>
+<p>That estimated <code>rows</code> ≠ actual <code>rows</code> is exactly the <strong>"problem signal"</strong> from Part 2 §2: it closes the §7.1 loop — <code>ANALYZE</code> keeps the notebook fresh, the planner reads it to cost paths, and <strong>stale statistics → bad estimate → bad plan → slow query</strong>.</p>
+
 <h2 id="p1-8">8. ACID</h2>
 <p>A group of actions happens <strong>all or nothing</strong> (a <strong>transaction</strong>): <strong>A</strong>tomic, <strong>C</strong>onsistent, <strong>I</strong>solated (MVCC), <strong>D</strong>urable (WAL).</p>
 <blockquote><strong>👦 Technical explanation.</strong> <strong>ACID</strong> names the four guarantees a <strong>transaction</strong> (<code>BEGIN … COMMIT</code>/<code>ROLLBACK</code>) gives — what makes a DB trustworthy for money/inventory/bookings. <strong>Atomicity</strong>: all-or-nothing (WAL + rollback). <strong>Consistency</strong>: every commit obeys all constraints. <strong>Isolation</strong>: concurrent transactions don't corrupt each other's view — tunable via <strong>isolation levels</strong> (Read Committed → Serializable), implemented with MVCC snapshots. <strong>Durability</strong>: once <code>COMMIT</code> returns, data survives a crash (the <code>fsync</code>ed WAL). §4 (WAL) and §5 (MVCC) are literally the machinery behind the "D" and the "I".</blockquote>
@@ -644,6 +717,57 @@
                         ▼
                    read 8KB disk → frame, insert tag, BM_VALID, pin → return frame</pre>
 
+<p><strong>How the pieces connect.</strong> The diagram above is the <em>flow</em> of a read; this one is the <strong>anatomy</strong> — the three structures that live in shared memory and how they point at one another. The key idea is that they are <strong>three parallel arrays indexed by the same <code>buf_id</code></strong>: the hash table translates a tag into a <code>buf_id</code>, and that same index gives you both the descriptor (<code>BufferDesc[buf_id]</code>) and the data frame (<code>BufferBlocks[buf_id]</code>).</p>
+<pre>  ┌──────────────────────── shared memory (fixed at startup) ────────────────────────┐
+  │                                                                                   │
+  │   SharedBufHash                 BufferDescriptors[]              BufferBlocks[]    │
+  │   (partitioned hash)            (1 per frame)                    (the 8 KB frames) │
+  │  ┌───────────────────┐         ┌────────────────────────┐      ┌────────────────┐ │
+  │  │ tag {relfilenode, │         │ state (atomic):        │      │ frame 0: 8 KB  │ │
+  │  │   forknum,blocknum}│─buf_id─▶│  refcount·usage(0–5)   │      │ frame 1: 8 KB  │ │
+  │  │        → buf_id    │         │  BM_DIRTY·BM_VALID·IO  │─────▶│ frame 2: 8 KB  │ │
+  │  │ 128 partitions,    │         │ content LWLock         │ same │   …            │ │
+  │  │ 1 BufMappingLock ea│         │ buffer tag · freeNext  │buf_id│ N = SB / 8 KB  │ │
+  │  └───────────────────┘         └────────────────────────┘      └───────┬────────┘ │
+  │                                        ▲                                │          │
+  │            replacement strategy ───────┘  picks victim                  │          │
+  │            (nextVictimBuffer clock-sweep · freelist · BAS_* rings)      │          │
+  └────────────────────────────────────────────────────────────────────────┼──────────┘
+                                                     smgrread / smgrwrite (8 KB)
+                                                                             ▼
+                                              Disk / OS page cache (relfilenode.forknum)</pre>
+<p>Read it like this: <strong>one frame</strong> is the union of three things indexed by the same <code>buf_id</code> — its hash entry (how you find it), its <code>BufferDesc</code> (its state: pin, recency, dirty/clean, locks) and its 8 KB block in <code>BufferBlocks[]</code> (the actual data). The replacement strategy only touches the descriptors to pick a victim; I/O against disk (or the OS page cache) only moves the data block.</p>
+<p><strong>Practical example — watching it happen (miss → hit and which frames a table occupies).</strong> With the <code>pg_buffercache</code> extension you can <em>look inside</em> shared_buffers, and with <code>EXPLAIN (ANALYZE, BUFFERS)</code> you see the jump from a disk read to a cache hit:</p>
+<pre>CREATE EXTENSION IF NOT EXISTS pg_buffercache;
+
+CREATE TABLE demo AS SELECT g AS id, repeat('x', 100) AS payload
+FROM generate_series(1, 50000) g;   -- ~7 MB → dozens of 8 KB pages
+
+-- Start cold (nothing touched yet), or restart the instance to clear the cache.
+
+-- 1) COLD READ: the page is not in shared_buffers → 'read' (miss)
+EXPLAIN (ANALYZE, BUFFERS, COSTS OFF)
+SELECT count(*) FROM demo;
+--  Buffers: shared read=834        ← 834 blocks pulled from disk/OS into the pool
+
+-- 2) SAME QUERY again: the pages are now cached → 'hit'
+EXPLAIN (ANALYZE, BUFFERS, COSTS OFF)
+SELECT count(*) FROM demo;
+--  Buffers: shared hit=834         ← 0 disk reads: all served from RAM
+
+-- 3) Which frames does 'demo' occupy, and how "hot" are they (usage_count)?
+SELECT c.relname,
+       count(*)                        AS frames,
+       pg_size_pretty(count(*) * 8192) AS cached,
+       round(avg(b.usagecount), 1)     AS avg_usage
+FROM   pg_buffercache b
+JOIN   pg_class c ON c.relfilenode = b.relfilenode
+WHERE  c.relname = 'demo'
+GROUP  BY c.relname;
+--  relname | frames | cached  | avg_usage
+--  demo    |    834 | 6672 kB |       1.0</pre>
+<p>What you just observed maps 1:1 onto the anatomy: the <code>shared read=834</code> in step 1 is 834 <strong>misses</strong> that walked the <code>MISS → StrategyGetBuffer → read 8KB → insert tag</code> branch of the flow diagram; the <code>shared hit=834</code> in step 2 is 834 <strong>hits</strong> that left via the <code>HIT → pin → return frame</code> branch; and step 3 lists the 834 <code>buf_id</code>s whose <code>BufferDesc</code> points at <code>demo</code>'s <code>relfilenode</code>, with their <code>usage_count</code> — the recency the clock-sweep hand will decrement when it next needs victims.</p>
+
 <h3>10.3 🪵 WAL — record anatomy, parallel insertion and group commit</h3>
 <p>The <strong>physical rule</strong>: <em>no data page reaches disk before its WAL record is durable.</em> Under the hood:</p>
 <ul>
@@ -667,6 +791,59 @@
          │
          ▼
     ✔ durable — one fsync covers every committer with LSN ≤ flushed point  = GROUP COMMIT</pre>
+
+<p><strong>How the components connect.</strong> The diagram above follows <em>one</em> record; this one is the <strong>whole WAL subsystem</strong> — who produces WAL, where it lives in memory, how it lands on disk, and who consumes it afterward. The piece that ties it all together is the <strong>LSN</strong> (Log Sequence Number): an ever-increasing byte offset that acts as the database's "clock", and every page carries the LSN of its last change (<code>pd_lsn</code>).</p>
+<pre>  PRODUCERS                MEMORY (shared)               DISK — pg_wal/          CONSUMERS
+  ─────────                ───────────────               ──────────────          ─────────
+  backend 1 ┐              ┌─────────────────┐           ┌──────────────────┐    ┌───────────────┐
+  backend 2 ┼─XLogInsert──▶│ 8 WAL insert    │           │ 16 MB segments   │──▶ │ checkpointer  │
+  backend N ┘              │ locks: reserve  │           │ 0000…01, 0000…02 │    │ (recycle segs,│
+                           │ byte range      │           │ written sequen-  │    │  REDO point)  │
+                           │ (atomic         │           │ tially, recycled │    ├───────────────┤
+                           │  CurrBytePos    │           └────────┬─────────┘──▶ │ archiver → PITR│
+                           │  → fixes LSN)   │                    │              ├───────────────┤
+                           └───────┬─────────┘           ┌────────▼─────────┐──▶ │ walsender     │
+                                   │                     │ pg_control       │    │ → replica     │
+                           ┌───────▼─────────┐           │ last checkpoint  │    ├───────────────┤
+                           │ WAL buffers     │           │ + REDO point     │──▶ │ startup proc  │
+                           │ (circular,      │           └──────────────────┘    │ REDO on crash │
+                           │  wal_buffers)   │                                    └───────────────┘
+                           └───────┬─────────┘
+                                   │  COMMIT: XLogFlush(LSN) · WALWriteLock · fsync
+                                   └──────────────────────▶ (bytes land in the 16 MB segments above)</pre>
+<p>Read it left to right: <strong>many backends</strong> produce records at once → the <strong>insert locks</strong> hand each one a byte range (that fixes LSN order cheaply) → they copy into the <strong>WAL buffers</strong> in RAM → at <code>COMMIT</code>, <code>XLogFlush</code> + <code>fsync</code> push them down into the <strong>16 MB segments</strong> in <code>pg_wal/</code> (the point at which the commit is durable) → and from there the WAL feeds its <strong>consumers</strong>: the checkpointer (recycles old segments), the archiver (PITR), the walsender (replicas), and, after a crash, the startup process (REDO).</p>
+<p><strong>Practical example — watching the WAL advance live.</strong> The LSN is observable through built-in functions; you can <em>measure</em> how much WAL an operation generates and watch the clock move:</p>
+<pre>-- 1) Where is the WAL "head" right now? Which segment does it fall in?
+SELECT pg_current_wal_lsn()                   AS current_lsn,
+       pg_walfile_name(pg_current_wal_lsn())  AS segment_file;
+--  current_lsn |          segment_file
+--  0/1A2B3C40  | 000000010000000000000001
+
+-- 2) Measure how much WAL an INSERT generates: capture the LSN before and after.
+SELECT pg_current_wal_lsn() AS before \gset
+CREATE TABLE accounts (id int, balance numeric);
+INSERT INTO accounts SELECT g, g*10 FROM generate_series(1, 100000) g;
+
+SELECT pg_size_pretty(
+         pg_wal_lsn_diff(pg_current_wal_lsn(), :'before')) AS wal_generated;
+--  wal_generated
+--  5544 kB          ← the INSERT left ~5.5 MB of WAL records in pg_wal/
+
+-- 3) The "D" in ACID in one line: the flag that decides whether COMMIT fsyncs.
+SHOW synchronous_commit;   --  on  → every COMMIT waits for the WAL fsync (durable)</pre>
+<p>And to <strong>open a real WAL record</strong> (seeing the <code>xl_rmid</code>, the size, the full-page image from §10.3 as data, not theory), the <code>pg_walinspect</code> extension (PG15+) decodes them:</p>
+<pre>CREATE EXTENSION IF NOT EXISTS pg_walinspect;
+
+-- WAL records between two LSNs, one per row:
+SELECT start_lsn, resource_manager, record_type,
+       record_length, block_ref
+FROM   pg_get_wal_records_info(:'before', pg_current_wal_lsn())
+LIMIT 5;
+--  start_lsn  | resource_manager | record_type | record_length | block_ref
+--  0/1A2B3C40 | Heap             | INSERT       |            59 | blkref #0: rel 1663/5/16401 blk 0
+--  0/1A2B3C7C | Heap             | INSERT       |            59 | blkref #0: rel 1663/5/16401 blk 0
+--  …          | Btree/Transaction/… (the xl_rmid from the XLogRecord header, already decoded)</pre>
+<p>Those rows are <strong>exactly</strong> the <code>XLogRecord</code> header from the diagram, already decoded: <code>resource_manager</code> is the <code>xl_rmid</code>, <code>record_length</code> is <code>xl_tot_len</code>, and <code>block_ref</code> is the block references (<code>XLogRecordBlockHeader</code>). The <code>wal_generated</code> from step 2 is the sum of all those <code>record_length</code>s — the WAL that the <code>COMMIT</code>'s <code>fsync</code> made durable before the dirty page ever went to disk.</p>
 
 <h3>10.4 🔀 MVCC — the tuple header, hint bits, snapshots and HOT</h3>
 <p>MVCC is implemented <strong>inside every row</strong>. A heap tuple carries <strong><code>HeapTupleHeaderData</code></strong>:</p>

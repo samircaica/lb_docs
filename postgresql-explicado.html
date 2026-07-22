@@ -571,6 +571,79 @@
 <p>Así se cierra el círculo con §6 (índices) y §5 (MVCC/VACUUM): <code>ANALYZE</code> (que <code>autovacuum</code> dispara junto al <code>VACUUM</code>) llena la libreta, el planner la lee para costear, y por eso <strong>estadísticas desactualizadas → mala estimación → mal plan → query lenta</strong>. La Parte 2 §2 enseña a leer el plan con <code>EXPLAIN</code>.</p>
 <blockquote>Nota de exactitud: los símbolos (<code>standard_planner</code>, <code>subquery_planner</code>, <code>query_planner</code>/<code>make_one_rel</code>, <code>standard_join_search</code>, <code>create_plan</code>, <code>cost_*</code> en <code>costsize.c</code>) son <strong>internos estándar de PostgreSQL</strong>, incluidos para que los ubiques en el fuente (<a href="https://github.com/postgres/postgres/tree/master/src/backend/optimizer">src/backend/optimizer</a>). Nombres y detalles finos pueden variar según la versión; verifica contra el código y la doc.</blockquote>
 
+<h3 id="p1-7-2">7.2 🧪 Un ejemplo práctico: ver al planner cambiar de opinión</h3>
+<p>La mejor forma de <em>entender</em> al planner es verlo <strong>elegir distinto para la misma tabla</strong> según cuántas filas cree que va a tocar. Montamos una tabla con 1 millón de filas y 1000 usuarios (≈ 1000 filas por usuario) y dejamos que <code>ANALYZE</code> llene la libretita de estadísticas (<code>pg_statistic</code>):</p>
+<pre>CREATE TABLE eventos AS
+SELECT g AS id,
+       (g % 1000)         AS usuario_id,   -- 1000 usuarios, ~1000 filas c/u
+       repeat('x', 50)    AS carga
+FROM generate_series(1, 1000000) g;        -- 1 millón de filas
+
+CREATE INDEX idx_eventos_usuario ON eventos(usuario_id);
+ANALYZE eventos;   -- llena pg_statistic: n_distinct≈1000, histograma, etc.</pre>
+<p><strong>Caso A — consulta selectiva (pocas filas) → gana el <code>Index Scan</code>.</strong> Pides un solo usuario: el planner estima ~1000 de 1 000 000 (0,1 %), así que unos pocos saltos aleatorios al índice salen <strong>más baratos</strong> que leer toda la tabla:</p>
+<pre>EXPLAIN ANALYZE SELECT * FROM eventos WHERE usuario_id = 42;
+--  Index Scan using idx_eventos_usuario on eventos
+--    (cost=0.42..3100 rows=1000 width=58) (actual ... rows=1000 loops=1)
+--    Index Cond: (usuario_id = 42)          ← usó el índice</pre>
+<p><strong>Caso B — consulta poco selectiva (muchas filas) → gana el <code>Seq Scan</code>.</strong> Ahora pides el 90 % de la tabla. El índice obligaría a ~900 000 saltos aleatorios al <em>heap</em>; leer todo de corrido (secuencial, <code>seq_page_cost</code> barato) cuesta menos, así que el planner <strong>descarta el índice a propósito</strong>:</p>
+<pre>EXPLAIN ANALYZE SELECT * FROM eventos WHERE usuario_id &lt; 900;
+--  Seq Scan on eventos
+--    (cost=0.00..21925 rows=900000 width=58) (actual ... rows=900000 loops=1)
+--    Filter: (usuario_id &lt; 900)             ← ignoró el índice a propósito</pre>
+<svg viewBox="0 0 880 340" class="diagram" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Cómo el planner elige Index Scan vs Seq Scan según la cardinalidad estimada">
+  <defs>
+    <marker id="arrpl2es" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L7,3 L0,6 z" fill="#475569"/>
+    </marker>
+  </defs>
+  <!-- query -->
+  <rect x="250" y="12" width="380" height="40" rx="9" fill="#f1f5f9" stroke="#94a3b8"/>
+  <text x="440" y="30" text-anchor="middle" font-size="12" font-weight="bold" fill="#334155">SELECT * FROM eventos WHERE usuario_id = ?</text>
+  <text x="440" y="45" text-anchor="middle" font-size="10.5" fill="#64748b">la misma forma de consulta, dos constantes distintas</text>
+  <!-- estimate -->
+  <rect x="250" y="72" width="380" height="44" rx="9" fill="#ecfdf5" stroke="#10b981"/>
+  <text x="440" y="90" text-anchor="middle" font-size="12" font-weight="bold" fill="#065f46">El planner estima cuántas filas coinciden</text>
+  <text x="440" y="105" text-anchor="middle" font-size="10.5" fill="#047857">pg_statistic: n_distinct, histograma (de ANALYZE)</text>
+  <!-- diamond -->
+  <polygon points="440,136 540,176 440,216 340,176" fill="#fff8f1" stroke="#eb6608"/>
+  <text x="440" y="181" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#b35309">¿selectivo?</text>
+  <!-- index scan branch -->
+  <rect x="40" y="248" width="360" height="72" rx="9" fill="#dbeafe" stroke="#2563eb"/>
+  <text x="220" y="268" text-anchor="middle" font-size="12" font-weight="bold" fill="#1e3a8a">Gana Index Scan</text>
+  <text x="220" y="284" text-anchor="middle" font-size="10.5" fill="#1e3a8a">pocos saltos aleatorios (random_page_cost)</text>
+  <text x="220" y="299" text-anchor="middle" font-size="10.5" fill="#1e3a8a">cost total menor → cheapest_total_path</text>
+  <text x="220" y="314" text-anchor="middle" font-size="10.5" font-style="italic" fill="#1e40af">= 42 → ~1000 de 1M (0,1%)</text>
+  <!-- seq scan branch -->
+  <rect x="480" y="248" width="360" height="72" rx="9" fill="#f1f5f9" stroke="#64748b"/>
+  <text x="660" y="268" text-anchor="middle" font-size="12" font-weight="bold" fill="#334155">Gana Seq Scan</text>
+  <text x="660" y="284" text-anchor="middle" font-size="10.5" fill="#334155">leer toda la tabla de corrido (seq_page_cost)</text>
+  <text x="660" y="299" text-anchor="middle" font-size="10.5" fill="#334155">cost total menor → cheapest_total_path</text>
+  <text x="660" y="314" text-anchor="middle" font-size="10.5" font-style="italic" fill="#475569">&lt; 900 → ~900k de 1M (90%)</text>
+  <!-- arrows -->
+  <line x1="440" y1="52" x2="440" y2="72" stroke="#475569" marker-end="url(#arrpl2es)"/>
+  <line x1="440" y1="116" x2="440" y2="136" stroke="#475569" marker-end="url(#arrpl2es)"/>
+  <path d="M340,176 L220,176 L220,248" fill="none" stroke="#475569" marker-end="url(#arrpl2es)"/>
+  <path d="M540,176 L660,176 L660,248" fill="none" stroke="#475569" marker-end="url(#arrpl2es)"/>
+  <text x="270" y="168" text-anchor="middle" font-size="10.5" font-weight="bold" fill="#1e3a8a">sí (pocas)</text>
+  <text x="612" y="168" text-anchor="middle" font-size="10.5" font-weight="bold" fill="#334155">no (muchas)</text>
+</svg>
+<p class="dgm-cap">Mismo índice, misma tabla — <strong>la decisión la dicta la cardinalidad estimada</strong>, no una regla fija. Eso es el costeo de §7.1 en vivo: <code>cost_index</code> vs <code>cost_seqscan</code>, y gana el más barato.</p>
+<p><strong>La trampa de las estadísticas viejas (el bug #1 de rendimiento).</strong> Insertamos 500 000 filas nuevas del usuario 42 <strong>sin</strong> correr <code>ANALYZE</code>. La libretita sigue diciendo "≈1000 filas", así que el planner elige <code>Index Scan</code>… pero ahora hay 501 000 filas: la estimación y la realidad <strong>divergen</strong> — el delator es <code>rows</code> estimado vs <code>rows</code> real:</p>
+<pre>INSERT INTO eventos
+SELECT 1000000 + g, 42, repeat('x', 50) FROM generate_series(1, 500000) g;
+
+EXPLAIN ANALYZE SELECT * FROM eventos WHERE usuario_id = 42;
+--  Index Scan ...  (cost=... rows=1000 ...) (actual ... rows=501000 loops=1)
+--                              ▲ estimado 1000        ▲ real 501000   ← ¡desfase 500×!
+
+ANALYZE eventos;   -- refresca pg_statistic
+
+EXPLAIN ANALYZE SELECT * FROM eventos WHERE usuario_id = 42;
+--  Seq Scan ...    (cost=... rows=501000 ...) (actual ... rows=501000 loops=1)
+--  Ahora el estimado acierta → el planner cambia a Seq Scan (el plan correcto)</pre>
+<p>Ese <code>rows</code> estimado ≠ <code>rows</code> real es exactamente la <strong>"señal de problema"</strong> de la Parte 2 §2: cierra el círculo de §7.1 — <code>ANALYZE</code> mantiene fresca la libretita, el planner la lee para costear, y <strong>estadísticas desactualizadas → mala estimación → mal plan → query lenta</strong>.</p>
+
 <h2 id="p1-8">8. ACID</h2>
 <p>Un grupo de acciones pasa <strong>todo o nada</strong> (una <strong>transacción</strong>): <strong>A</strong>tómico, <strong>C</strong>onsistente, <strong>A</strong>islado (MVCC), <strong>D</strong>urable (WAL).</p>
 <blockquote><strong>👦 Explicación técnica.</strong> <strong>ACID</strong> nombra las cuatro garantías de una <strong>transacción</strong> (<code>BEGIN … COMMIT</code>/<code>ROLLBACK</code>) — lo que hace confiable a una base para dinero/inventario/reservas. <strong>Atomicidad</strong>: todo o nada (WAL + rollback). <strong>Consistencia</strong>: cada commit cumple todas las restricciones. <strong>Aislamiento</strong>: las transacciones concurrentes no corrompen la vista de las demás — ajustable con <strong>niveles de aislamiento</strong> (Read Committed → Serializable), vía snapshots de MVCC. <strong>Durabilidad</strong>: una vez que <code>COMMIT</code> retorna, el dato sobrevive a una caída (el WAL con <code>fsync</code>). §4 (WAL) y §5 (MVCC) son literalmente la maquinaria detrás de la "D" y la "I".</blockquote>
@@ -635,6 +708,58 @@
                         ▼
                    lee 8KB disco → frame, inserta tag, BM_VALID, pin → devuelve frame</pre>
 
+<p><strong>Cómo están conectadas las piezas.</strong> El diagrama de arriba es el <em>flujo</em> de una lectura; este es la <strong>anatomía</strong> — las tres estructuras que viven en memoria compartida y cómo se apuntan entre sí. La clave es que son <strong>tres arrays paralelos indexados por el mismo <code>buf_id</code></strong>: la tabla hash traduce un tag a un <code>buf_id</code>, y ese mismo índice te da tanto el descriptor (<code>BufferDesc[buf_id]</code>) como el frame de datos (<code>BufferBlocks[buf_id]</code>).</p>
+<pre>  ┌──────────────────── memoria compartida (fija al arranque) ───────────────────────┐
+  │                                                                                   │
+  │   SharedBufHash                 BufferDescriptors[]              BufferBlocks[]    │
+  │   (hash particionada)           (1 por frame)                    (los frames 8 KB)│
+  │  ┌───────────────────┐         ┌────────────────────────┐      ┌────────────────┐ │
+  │  │ tag {relfilenode, │         │ state (atómico):       │      │ frame 0: 8 KB  │ │
+  │  │   forknum,blocknum}│─buf_id─▶│  refcount·usage(0–5)   │      │ frame 1: 8 KB  │ │
+  │  │        → buf_id    │         │  BM_DIRTY·BM_VALID·IO  │─────▶│ frame 2: 8 KB  │ │
+  │  │ 128 particiones,   │         │ content LWLock         │mismo │   …            │ │
+  │  │ 1 BufMappingLock c/u│        │ buffer tag · freeNext  │buf_id│ N = SB / 8 KB  │ │
+  │  └───────────────────┘         └────────────────────────┘      └───────┬────────┘ │
+  │                                        ▲                                │          │
+  │        estrategia de reemplazo ────────┘  elige víctima                 │          │
+  │        (nextVictimBuffer clock-sweep · freelist · rings BAS_*)          │          │
+  └────────────────────────────────────────────────────────────────────────┼──────────┘
+                                                     smgrread / smgrwrite (8 KB)
+                                                                             ▼
+                                              Disco / OS page cache (relfilenode.forknum)</pre>
+<p>Léelo así: <strong>un frame</strong> es la unión de tres cosas indexadas por el mismo <code>buf_id</code> — su entrada en el hash (cómo lo encuentras), su <code>BufferDesc</code> (su estado: pin, recencia, sucio/limpio, locks) y su bloque de 8 KB en <code>BufferBlocks[]</code> (los datos reales). La estrategia de reemplazo solo toca los descriptores para elegir víctima; el I/O contra disco (o el page cache del SO) solo mueve el bloque de datos.</p>
+<p><strong>Ejemplo práctico — verlo en caliente (miss → hit y qué frames ocupa una tabla).</strong> Con la extensión <code>pg_buffercache</code> puedes <em>mirar dentro</em> de shared_buffers, y con <code>EXPLAIN (ANALYZE, BUFFERS)</code> ves el salto de lectura de disco a acierto de caché:</p>
+<pre>CREATE EXTENSION IF NOT EXISTS pg_buffercache;
+
+CREATE TABLE demo AS SELECT g AS id, repeat('x', 100) AS payload
+FROM generate_series(1, 50000) g;   -- ~7 MB → decenas de páginas de 8 KB
+
+-- Reinicia la caché para partir de frío (o reinicia la instancia):
+-- (aquí basta con no haberla tocado todavía)
+
+-- 1) LECTURA FRÍA: la página no está en shared_buffers → 'read' (miss)
+EXPLAIN (ANALYZE, BUFFERS, COSTS OFF)
+SELECT count(*) FROM demo;
+--  Buffers: shared read=834        ← 834 bloques traídos de disco/OS al pool
+
+-- 2) MISMA CONSULTA otra vez: ahora las páginas ya están cacheadas → 'hit'
+EXPLAIN (ANALYZE, BUFFERS, COSTS OFF)
+SELECT count(*) FROM demo;
+--  Buffers: shared hit=834         ← 0 lecturas de disco: todo servido desde RAM
+
+-- 3) ¿Qué frames ocupa 'demo', y cuán "calientes" están (usage_count)?
+SELECT c.relname,
+       count(*)                       AS frames,
+       pg_size_pretty(count(*) * 8192) AS en_cache,
+       round(avg(b.usagecount), 1)    AS usage_medio
+FROM   pg_buffercache b
+JOIN   pg_class c ON c.relfilenode = b.relfilenode
+WHERE  c.relname = 'demo'
+GROUP  BY c.relname;
+--  relname | frames | en_cache | usage_medio
+--  demo    |    834 | 6672 kB  |         1.0</pre>
+<p>Lo que acabas de observar mapea 1:1 con la anatomía: el <code>shared read=834</code> del paso 1 son 834 <strong>misses</strong> que recorrieron la rama <code>MISS → StrategyGetBuffer → lee 8KB → inserta tag</code> del diagrama de flujo; el <code>shared hit=834</code> del paso 2 son 834 <strong>hits</strong> que salieron por la rama <code>HIT → pin → devuelve frame</code>; y el paso 3 lista los 834 <code>buf_id</code> cuyo <code>BufferDesc</code> apunta al <code>relfilenode</code> de <code>demo</code>, con su <code>usage_count</code> — la recencia que la manecilla clock-sweep irá decrementando cuando necesite víctimas.</p>
+
 <h3>10.3 🪵 WAL — anatomía del registro, inserción paralela y group commit</h3>
 <p>La <strong>regla física</strong>: <em>ninguna página de datos llega al disco antes de que su registro WAL sea durable.</em> Por dentro:</p>
 <ul>
@@ -658,6 +783,59 @@
          │
          ▼
     ✔ durable — un fsync cubre a todos los que commitean con LSN ≤ punto volcado  = GROUP COMMIT</pre>
+
+<p><strong>Cómo están conectados los componentes.</strong> El diagrama de arriba sigue <em>un</em> registro; este es el <strong>subsistema WAL completo</strong> — quién produce el WAL, dónde vive en memoria, cómo aterriza en disco y quién lo consume después. La pieza que lo une todo es el <strong>LSN</strong> (Log Sequence Number): un desplazamiento de bytes siempre creciente que funciona como el "reloj" de la base, y cada página lleva el LSN de su último cambio (<code>pd_lsn</code>).</p>
+<pre>  PRODUCTORES              MEMORIA (compartida)          DISCO — pg_wal/         CONSUMIDORES
+  ───────────              ────────────────────          ───────────────         ────────────
+  backend 1 ┐              ┌─────────────────┐           ┌──────────────────┐    ┌───────────────┐
+  backend 2 ┼─XLogInsert──▶│ 8 WAL insert    │           │ segmentos 16 MB  │──▶ │ checkpointer  │
+  backend N ┘              │ locks: reservan │           │ 0000…01, 0000…02 │    │ (recicla segs,│
+                           │ rango de bytes  │           │ escritos secuen- │    │  REDO point)  │
+                           │ (CurrBytePos    │           │ cialmente, recic.│    ├───────────────┤
+                           │  atómico        │           └────────┬─────────┘──▶ │ archiver → PITR│
+                           │  → fija el LSN) │                    │              ├───────────────┤
+                           └───────┬─────────┘           ┌────────▼─────────┐──▶ │ walsender     │
+                                   │                     │ pg_control       │    │ → réplica     │
+                           ┌───────▼─────────┐           │ último checkpoint│    ├───────────────┤
+                           │ WAL buffers     │           │ + REDO point     │──▶ │ startup proc  │
+                           │ (circular,      │           └──────────────────┘    │ REDO tras crash│
+                           │  wal_buffers)   │                                    └───────────────┘
+                           └───────┬─────────┘
+                                   │  COMMIT: XLogFlush(LSN) · WALWriteLock · fsync
+                                   └──────────────────────▶ (los bytes aterrizan en los segmentos de arriba)</pre>
+<p>Léelo de izquierda a derecha: <strong>muchos backends</strong> producen registros a la vez → los <strong>insert locks</strong> le dan a cada uno un rango de bytes (eso fija el orden de LSN barato) → copian a los <strong>WAL buffers</strong> en RAM → en el <code>COMMIT</code>, <code>XLogFlush</code> + <code>fsync</code> los bajan a los <strong>segmentos de 16 MB</strong> en <code>pg_wal/</code> (el punto en que el commit es durable) → y desde ahí el WAL alimenta a sus <strong>consumidores</strong>: el checkpointer (recicla segmentos viejos), el archiver (PITR), el walsender (réplicas) y, tras un crash, el startup process (REDO).</p>
+<p><strong>Ejemplo práctico — ver el WAL avanzar en vivo.</strong> El LSN es observable con funciones nativas; puedes <em>medir</em> cuánto WAL genera una operación y ver el reloj avanzar:</p>
+<pre>-- 1) ¿Dónde está el "cabezal" del WAL ahora mismo? ¿En qué segmento cae?
+SELECT pg_current_wal_lsn()                          AS lsn_actual,
+       pg_walfile_name(pg_current_wal_lsn())         AS archivo_segmento;
+--  lsn_actual  |          archivo_segmento
+--  0/1A2B3C40  | 000000010000000000000001
+
+-- 2) Mide cuánto WAL genera un INSERT: captura el LSN antes y después.
+SELECT pg_current_wal_lsn() AS antes \gset
+CREATE TABLE cuentas (id int, saldo numeric);
+INSERT INTO cuentas SELECT g, g*10 FROM generate_series(1, 100000) g;
+
+SELECT pg_size_pretty(
+         pg_wal_lsn_diff(pg_current_wal_lsn(), :'antes')) AS wal_generado;
+--  wal_generado
+--  5544 kB          ← el INSERT dejó ~5,5 MB de registros WAL en pg_wal/
+
+-- 3) La "D" de ACID en una línea: el flag que decide si el COMMIT hace fsync.
+SHOW synchronous_commit;   --  on  → cada COMMIT espera el fsync del WAL (durable)</pre>
+<p>Y para <strong>abrir un registro WAL de verdad</strong> (ver el <code>xl_rmid</code>, el tamaño, la full-page image de §10.3 como datos, no como teoría), la extensión <code>pg_walinspect</code> (PG15+) los decodifica:</p>
+<pre>CREATE EXTENSION IF NOT EXISTS pg_walinspect;
+
+-- Registros WAL entre dos LSN, uno por fila:
+SELECT start_lsn, resource_manager, record_type,
+       record_length, block_ref
+FROM   pg_get_wal_records_info(:'antes', pg_current_wal_lsn())
+LIMIT 5;
+--  start_lsn  | resource_manager | record_type | record_length | block_ref
+--  0/1A2B3C40 | Heap             | INSERT       |            59 | blkref #0: rel 1663/5/16401 blk 0
+--  0/1A2B3C7C | Heap             | INSERT       |            59 | blkref #0: rel 1663/5/16401 blk 0
+--  …          | Btree/Transaction/… (el xl_rmid de la cabecera XLogRecord, ya decodificado)</pre>
+<p>Esas filas son <strong>exactamente</strong> la cabecera <code>XLogRecord</code> del diagrama, ya decodificada: <code>resource_manager</code> es el <code>xl_rmid</code>, <code>record_length</code> es <code>xl_tot_len</code>, y <code>block_ref</code> son las referencias a bloques (<code>XLogRecordBlockHeader</code>). El <code>wal_generado</code> del paso 2 es la suma de todos esos <code>record_length</code> — el WAL que el <code>fsync</code> del <code>COMMIT</code> hizo durable antes de que la página sucia bajara al disco.</p>
 
 <h3>10.4 🔀 MVCC — la cabecera de la tupla, hint bits, snapshots y HOT</h3>
 <p>MVCC está implementado <strong>dentro de cada fila</strong>. Una tupla del heap lleva <strong><code>HeapTupleHeaderData</code></strong>:</p>
