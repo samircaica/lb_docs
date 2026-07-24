@@ -18,9 +18,9 @@
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     line-height: 1.7;
     color: var(--pg-dark);
-    max-width: 900px;
+    max-width: 1280px;
     margin: 0 auto;
-    padding: 2rem 1.5rem 5rem;
+    padding: 2.5rem 3rem 5rem;
     background: #fff;
   }
   header {
@@ -143,10 +143,37 @@
   .toc .track-label { display:block; margin: 1rem 0 .2rem; padding: .25rem .6rem; border-radius: 6px; font-size: .78rem; font-weight: 700; letter-spacing: .02em; text-transform: uppercase; color:#fff; }
   .toc .tl-A { background:#38a169; } .toc .tl-B { background:#3182ce; }
   .toc .tl-C { background:#d69e2e; } .toc .tl-D { background:#e53e3e; }
+  /* ===== Responsive & overflow safety (screens) — added to fit notebook/tablet/phone ===== */
+  code { overflow-wrap: anywhere; word-break: break-word; }
+  a { overflow-wrap: break-word; }
+  @media (max-width: 820px) {
+    header { padding: 1.9rem 1.4rem; }
+    header h1 { font-size: 1.6rem; }
+    header p { font-size: 1rem; }
+    .part-banner { font-size: 1.1rem; padding: .9rem 1.15rem; }
+    /* wide tables scroll inside themselves instead of pushing the page width */
+    table { display: block; width: max-content; max-width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  }
+  @media (max-width: 560px) {
+    body { padding: 1.2rem 1rem 3rem; line-height: 1.6; }
+    header { padding: 1.4rem 1.1rem; border-radius: 12px; }
+    header h1 { font-size: 1.4rem; }
+    header p { font-size: .95rem; }
+    h2 { margin-top: 2rem; }
+    h4 { font-size: .98rem; }
+    pre { font-size: .8rem; padding: .9rem 1rem; }
+    table { font-size: .88rem; }
+    th, td { padding: .5rem .6rem; }
+    .toc, .howto { padding: 1rem 1.1rem; }
+    ul { padding-left: 1.15rem; }
+  }
+
   @media print {
     /* Normal text 14px; everything else is in rem, so it scales proportionally down
        from this root — same visual hierarchy, just smaller, no big jumps. */
     html { font-size: 14px; }
+    /* undo the screen "table becomes block" rule so print keeps full-width tables */
+    table { display: table; width: 100%; overflow-x: visible; }
     @page { size: letter; margin: 12mm; }
     body { padding: 0; max-width: none; }
     header { box-shadow: none; }
@@ -178,7 +205,7 @@
 <header>
   <h1>🐘 PostgreSQL &amp; Lakebase explained</h1>
   <p>From a 5-year-old to an advanced professor — learn PostgreSQL first, then Databricks Lakebase.</p>
-  <p style="font-size:.82rem;opacity:.6;margin:.5rem 0 0">📅 Generated: 2026-07-22 15:56 UTC</p>
+  <p style="font-size:.82rem;opacity:.6;margin:.5rem 0 0">📅 Generated: 2026-07-24 23:25 UTC</p>
 </header>
 
 <section class="howto">
@@ -2039,6 +2066,12 @@ FROM pg_class WHERE relkind='r' ORDER BY age(relfrozenxid) DESC LIMIT 20;</code>
 
 <h2 id="p4-6">6. 🌿 How branching works on the inside</h2>
 <p>A <strong>branch</strong> is a <strong>copy-on-write clone</strong> of your database: it's created instantly because it <strong>doesn't copy data</strong>, it only creates a reference to a point in the history. Recalling Part 4.0: the storage (pageservers) keeps the data as <strong>base images + WAL deltas</strong> addressed by <strong>LSN</strong>. Branching takes advantage of exactly that.</p>
+<blockquote>⚠️ <strong>Key clarification — a branch and a compute are two different things (and yes, each branch runs its own independent compute).</strong> People often assume a "branch" is a running database. It is not. A <strong>branch is a <em>storage timeline</em></strong> — a pointer <code>ancestor + branch LSN</code> in the pageserver; it holds data, not CPU or RAM, and executes no SQL by itself. A <strong>compute (endpoint) is a <em>real, separate PostgreSQL process</em></strong> (a Kubernetes Pod) that runs the queries. They are <strong>decoupled</strong>: the branch is <em>what</em> you read/write, the compute is <em>who</em> serves it.
+<ul>
+  <li><strong>Is it real that each branch runs an independent compute?</strong> Yes. When a branch is served, <code>compute_manager</code> provisions it <strong>its own Pod/ReplicaSet</strong> with its own CPU/RAM, autoscaling, scale-to-zero, and identity (<code>databricks_branch_id</code>) — a genuinely separate Postgres, <strong>not</strong> a logical view inside the parent's compute (verified in Part 5 §5.16).</li>
+  <li><strong>But the mapping isn't rigidly 1:1.</strong> A branch can exist with <strong>no compute at all</strong> (storage only), and its compute can be <strong>asleep</strong> (scale-to-zero) until a connection arrives; computes are assigned/woken on demand (pre-warmed pools make this fast).</li>
+  <li><strong>What it implies.</strong> The computes are isolated (load on a branch never touches the parent — separate process, separate WAL, separate <code>DeltaLayer</code>s in its own timeline), scale and stop independently, and are billed per active endpoint — <strong>while the storage history <em>below</em> the branch LSN is shared copy-on-write, not copied.</strong> So you get <em>compute isolation</em> over <em>shared storage lineage</em>, not physically independent databases.</li>
+</ul></blockquote>
 
 <svg viewBox="0 0 880 380" class="diagram" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Branching: timeline and LSN">
   <defs>
@@ -2608,8 +2641,14 @@ cred = w.database.generate_database_credential(
 <p>The requests inherit from <code>NeonRequest</code> and the responses from <code>NeonResponse</code> (over the base type <code>NeonMessage</code> with tag, request id, and LSN). The <code>NeonGetPageRequest</code> carries <code>{ NeonRequest hdr; NRelFileInfo rinfo; ForkNumber forknum; BlockNumber blkno; }</code> — that is, it <strong>identifies a page by (relation, fork, block) and an LSN</strong>. On the Rust side, in the <code>pageserver_api</code> crate, the equivalent messages of the <em>pagestream</em> flow are <code>PagestreamGetPageRequest</code>, <code>PagestreamExistsRequest</code>, <code>PagestreamNblocksRequest</code>, etc., served by the pageserver's <em>page service</em>.</p>
 
 <h2 id="p5-4">4. Safekeeper + walproposer (the consensus &amp; WAL high availability)</h2>
-<p>The <strong>durability tier</strong> is a Paxos-style <strong>proposer/acceptor</strong> protocol split between the <strong>proposer</strong> (the leader, running as the <code>walproposer</code> background worker inside the compute, C) and the <strong>acceptors</strong> (the safekeepers, Rust). A timeline is replicated across a set of safekeepers (<strong>typically 3</strong>); the WAL is durable the instant a <strong>majority</strong> has it — this replaces the local <code>fsync</code> of stock Postgres.</p>
-<h3>The proposer: <code>walproposer.c</code> / <code>walproposer.h</code> (compute)</h3>
+<blockquote>📖 <strong>What this is and why it matters.</strong> The safekeepers are the component that makes a Lakebase write <em>durable</em>. In stock Postgres, a <code>COMMIT</code> is safe the moment the WAL record is <code>fsync</code>-ed to the local disk. Lakebase has <strong>no local disk to trust</strong> — the compute is stateless and can be killed and rescheduled at any moment — so "safe on my disk" is replaced by "safe on a <strong>majority of independent safekeeper nodes</strong>." This is the single most important durability guarantee in the whole system, so it deserves its own chapter. This section answers, in order: <strong>(4.1) what a safekeeper is and why it exists</strong>, <strong>(4.2) how it works internally</strong>, <strong>(4.3) who it talks to</strong>, and <strong>(4.4) how the tier survives failures</strong>.</blockquote>
+
+<h3>4.1 What a safekeeper is (and why it exists)</h3>
+<p>🧒 <strong>For a 5-year-old.</strong> Imagine you draw something amazing and you want to be <em>absolutely sure</em> it can never be lost — even if your own notebook gets thrown away. So instead of keeping the drawing yourself, you photocopy it and hand a copy to <strong>three trusted friends</strong> who each live in a different house. The rule is: your drawing "counts as saved" the moment <strong>at least two of the three friends</strong> say "got it, I filed it away." Now one friend can lose their copy, or move away, or be asleep — and your drawing is still safe, because the <em>majority</em> still has it. The safekeepers are those three friends, and the "at least two of three" rule is the <strong>quorum</strong>.</p>
+<p>👦 <strong>A precise definition.</strong> A safekeeper is a small, storage-only Rust service whose one job is to hold the WAL (the redo log of every change) <strong>durably and by consensus</strong>. Lakebase runs a set of them per database — <strong>typically 3</strong> — and a transaction is only acknowledged to the client as committed once a <strong>majority</strong> of them have <code>fsync</code>-ed the WAL up to that point. Because durability comes from <em>agreement between independent nodes</em> rather than from one local <code>fsync</code>, the compute can be completely stateless: it can crash and restart on another machine and lose nothing, because the WAL that defines the database's state lives on the safekeepers (and, later, in the pageserver and S3). The safekeepers are the <strong>durability tier</strong> — separate from the <strong>compute tier</strong> (runs SQL) and the <strong>storage/pageserver tier</strong> (materializes pages).</p>
+<p>🎓 <strong>The technical shape.</strong> The tier is a Paxos-style <strong>proposer/acceptor</strong> protocol split between the <strong>proposer</strong> (the leader, running as the <code>walproposer</code> background worker inside the compute, C) and the <strong>acceptors</strong> (the safekeepers, Rust). A timeline is replicated across the set of safekeepers (<strong>typically 3</strong>); the WAL is durable the instant a <strong>majority</strong> has flushed it — this replaces the local <code>fsync</code> of stock Postgres.</p>
+
+<h3>4.2 How it works internally — the proposer: <code>walproposer.c</code> / <code>walproposer.h</code> (compute)</h3>
 <ul>
   <li>Central struct <code>WalProposer</code> (the protocol state machine) and <code>Safekeeper</code> (one connection descriptor per acceptor); <code>WalProposerConfig</code>.</li>
   <li>Functions: <code>WalProposerCreate()</code>, <code>WalProposerStart()</code>, <code>WalProposerBroadcast()</code>, <code>WalProposerPoll()</code>.</li>
@@ -2624,7 +2663,56 @@ cred = w.database.generate_database_credential(
   <li><strong>Election:</strong> <code>handle_vote_request</code> grants a vote only if <code>acceptor_state.term &lt; msg.term</code>, and <strong>persists the new term (fsync) before replying</strong> — so a rebooted safekeeper never double-votes for a term (enforced by the <code>test_voting</code> unit test).</li>
   <li><strong>Single WAL line (no split-brain):</strong> <code>TermHistory</code> (a <code>Vec&lt;TermLsn&gt;</code>) records where each term begins. <code>find_highest_common_point</code> refuses to adopt a proposer's history if the same index has a different LSN, and <code>handle_elected</code> refuses to truncate below <code>commit_lsn</code>. An acceptor accepts <code>AppendRequest</code>s <strong>only in its current term</strong>; a stale proposer gets a <code>term_only</code> <code>AppendResponse</code> that forces it to re-elect. Since each new proposer must win a majority (bumping the term and truncating to the common point), <strong>only one WAL line ever commits</strong>. TLA+ specs live under <code>safekeeper/spec/</code>.</li>
 </ul>
-<h3>High availability — how the WAL tier survives failures</h3>
+
+<h3>4.3 Who a safekeeper interacts with</h3>
+<p>A safekeeper never works alone — it sits at the center of five relationships. Note the one that is <strong>absent</strong>: safekeepers <strong>never talk to each other for consensus</strong> (a common misconception). All coordination is either proposer-driven or gossip-through-a-broker.</p>
+<svg viewBox="0 0 860 340" class="diagram" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="What a safekeeper interacts with">
+  <defs>
+    <marker id="arrSKiC" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L7,3 L0,6 z" fill="#475569"/></marker>
+  </defs>
+  <rect x="350" y="140" width="170" height="58" rx="8" fill="#f0fff4" stroke="#38a169" stroke-width="1.5"/>
+  <text x="435" y="164" text-anchor="middle" font-size="12" font-weight="700" fill="#276749">this safekeeper</text>
+  <text x="435" y="181" text-anchor="middle" font-size="9.5" fill="#718096">acceptor · Rust</text>
+  <rect x="60" y="145" width="170" height="48" rx="8" fill="#eef2ff" stroke="#6366f1"/>
+  <text x="145" y="166" text-anchor="middle" font-size="11" font-weight="700" fill="#4338ca">① walproposer</text>
+  <text x="145" y="182" text-anchor="middle" font-size="9" fill="#718096">compute · leader/proposer</text>
+  <path d="M230,162 L350,162" stroke="#475569" marker-end="url(#arrSKiC)"/>
+  <path d="M350,178 L230,178" stroke="#475569" marker-end="url(#arrSKiC)"/>
+  <text x="290" y="155" text-anchor="middle" font-size="8.5" fill="#718096">AppendRequest/Vote</text>
+  <text x="290" y="192" text-anchor="middle" font-size="8.5" fill="#718096">AppendResponse</text>
+  <rect x="345" y="30" width="180" height="48" rx="8" fill="#fefce8" stroke="#ca8a04"/>
+  <text x="435" y="51" text-anchor="middle" font-size="11" font-weight="700" fill="#854d0e">② storage_broker</text>
+  <text x="435" y="67" text-anchor="middle" font-size="9" fill="#718096">gossip pub/sub (1/s)</text>
+  <path d="M425,140 L425,78" stroke="#a0aec0" stroke-dasharray="3 3" marker-end="url(#arrSKiC)"/>
+  <path d="M445,78 L445,140" stroke="#a0aec0" stroke-dasharray="3 3" marker-end="url(#arrSKiC)"/>
+  <rect x="640" y="30" width="180" height="48" rx="8" fill="#ebf8ff" stroke="#3182ce"/>
+  <text x="730" y="51" text-anchor="middle" font-size="11" font-weight="700" fill="#2c5282">③ pageserver</text>
+  <text x="730" y="67" text-anchor="middle" font-size="9" fill="#718096">WalReceiver — consumes WAL</text>
+  <path d="M640,54 L525,54" stroke="#a0aec0" stroke-dasharray="3 3" marker-end="url(#arrSKiC)"/>
+  <rect x="640" y="145" width="180" height="48" rx="8" fill="#f0fdf4" stroke="#16a34a"/>
+  <text x="730" y="166" text-anchor="middle" font-size="11" font-weight="700" fill="#14532d">④ S3</text>
+  <text x="730" y="182" text-anchor="middle" font-size="9" fill="#718096">offloader uploads WAL</text>
+  <path d="M520,169 L640,169" stroke="#475569" marker-end="url(#arrSKiC)"/>
+  <rect x="345" y="260" width="180" height="48" rx="8" fill="#faf5ff" stroke="#9333ea"/>
+  <text x="435" y="281" text-anchor="middle" font-size="11" font-weight="700" fill="#6b21a8">⑤ storage controller / HCC</text>
+  <text x="435" y="297" text-anchor="middle" font-size="9" fill="#718096">create/pull · membership (RFC-035)</text>
+  <path d="M435,260 L435,198" stroke="#475569" marker-end="url(#arrSKiC)"/>
+  <rect x="60" y="260" width="170" height="48" rx="8" fill="#f0fff4" stroke="#38a169" stroke-dasharray="5 4"/>
+  <text x="145" y="281" text-anchor="middle" font-size="11" font-weight="700" fill="#276749">⑥ peer safekeeper</text>
+  <text x="145" y="297" text-anchor="middle" font-size="9" fill="#9b2c2c">backfill only, never consensus</text>
+  <path d="M230,284 C300,284 320,220 350,196" stroke="#a0aec0" stroke-dasharray="3 3" fill="none" marker-end="url(#arrSKiC)"/>
+</svg>
+<p class="dgm-cap">Solid arrows = WAL/consensus traffic; dashed = status gossip or control/backfill. Safekeepers coordinate <em>only</em> through the proposer or the broker — never peer-to-peer for consensus.</p>
+<ol>
+  <li><strong>The walproposer (compute) — its only "boss" for writes.</strong> The proposer is the single writer: it runs the election (<code>VoteRequest</code>/<code>VoteResponse</code>), then streams <code>AppendRequest</code>s carrying WAL and reads back <code>AppendResponse</code>s (each with the acceptor's <code>flush_lsn</code>). The safekeeper is otherwise <strong>passive</strong> — it does not initiate writes.</li>
+  <li><strong>The <code>storage_broker</code> — the gossip bus (<code>broker.rs</code>).</strong> Each safekeeper <em>publishes</em> a <code>SafekeeperTimelineInfo</code> (its term, <code>flush_lsn</code>, <code>commit_lsn</code>, <code>remote_consistent_lsn</code>, …) roughly <strong>once per second</strong>, and <em>subscribes</em> to see where its peers are. This is how a node learns it is behind without any direct peer-to-peer consensus channel.</li>
+  <li><strong>The pageserver (<code>WalReceiver</code>) — the downstream consumer.</strong> The pageserver needs the committed WAL to materialize pages. It uses the broker to discover <strong>which safekeeper has the newest LSN</strong>, then opens a physical replication stream from that one and ingests the WAL into its layers (§5). Exactly <strong>one</strong> active safekeeper→pageserver stream is kept at a time.</li>
+  <li><strong>S3 — the cold backup.</strong> One safekeeper is elected <strong>offloader</strong> and uploads WAL segments to object storage so the tier can trim local copies (<code>remove_wal.rs</code>, <code>wal_backup.rs</code>) once the data is both consumed and backed up.</li>
+  <li><strong>The storage controller / HCC — the control plane.</strong> It creates timelines on the node, copies a timeline to a new node (<code>pull_timeline</code>), and orchestrates <strong>membership changes</strong> (adding/removing a safekeeper, RFC-035). It never carries WAL — only control operations.</li>
+  <li><strong>Peer safekeepers — for backfill only, never consensus.</strong> When a lagging node rejoins, <code>recovery.rs</code> lets it pull missing WAL from a peer <strong>donor</strong> via a physical replication stream — but only when no live compute is streaming, so it never competes with the proposer. This is data catch-up, <em>not</em> a consensus conversation.</li>
+</ol>
+
+<h3>4.4 How the WAL tier survives failures</h3>
 <svg viewBox="0 0 860 300" class="diagram" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Safekeeper high availability and quorum">
   <defs>
     <marker id="arrSK" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L7,3 L0,6 z" fill="#475569"/></marker>
@@ -2657,6 +2745,84 @@ cred = w.database.generate_database_credential(
 <blockquote>🧱 <strong>Databricks (hadron) specifics.</strong> <code>safekeeper/src/hadron.rs</code> adds registration with the <strong>HCC</strong> (Hadron Cluster Coordinator) for the v1/HCM control path, a <strong>global-disk-usage limiter</strong> (<code>GLOBAL_DISK_LIMIT_EXCEEDED</code>) that stops accepting WAL when the volume is full, <code>hadron_determine_offloader</code> (re-elects the offloader if a node lags too far), and <strong>CMK/fscrypt encryption</strong> fields (<code>dbx_workspace_id</code>, <code>dbx_encryption_enabled</code>). The core protocol, <code>TermHistory</code>, quorum semantics, broker gossip and RFC-035 membership are inherited <strong>unchanged</strong> from Neon.</blockquote>
 
 <h2 id="p5-5">5. Pageserver: the layer engine (Rust)</h2>
+<blockquote>📖 <strong>What this is and why it matters.</strong> If the safekeepers (§4) are what makes a write <em>durable</em>, the pageserver is what makes a write <em>readable again</em>. In stock Postgres the on-disk <strong>heap</strong> is the source of truth: a page lives in a file and you read it back directly. Lakebase throws that away — the compute is stateless and keeps <strong>no permanent copy of any page</strong>. Instead the pageserver <strong>reconstructs every 8 KB page on demand</strong> from a base snapshot plus the WAL. It is the <strong>storage tier</strong> that replaces the local heap, and it's the single busiest read component in the system, so it deserves its own chapter. This section answers, in order: <strong>(5.0.1) what a pageserver is and why it exists</strong>, <strong>(5.0.2) who it talks to</strong>, then the internals — the layer engine (below), <strong>HA &amp; failover (§5.1)</strong>, <strong>sharding (§5.2)</strong>, and <strong>the storage controller (§5.3)</strong>.</blockquote>
+
+<h3>5.0.1 What a pageserver is (and why it exists)</h3>
+<p>🧒 <strong>For a 5-year-old.</strong> Imagine a library where nobody keeps the finished, up-to-date books on the shelf. Instead the librarian keeps two things: <strong>(a)</strong> an <em>old photo</em> of each page, taken a while ago, and <strong>(b)</strong> a neat pile of <em>sticky notes</em>, one for every little change made to that page since the photo. When you ask "please give me page 42 exactly as it looks <strong>right now</strong>," the librarian grabs the old photo of page 42 and quickly re-applies all the sticky notes for that page, in order, until it's perfectly up to date — then hands you the fresh page. The librarian never has to keep millions of finished pages lying around: it can always <strong>rebuild any page, as of any moment</strong>, from the photo plus the notes. The pageserver is that librarian; the "old photo" is an <strong>image layer</strong>, the "sticky notes" are <strong>WAL deltas</strong>, and re-applying them is <strong>WAL redo</strong>.</p>
+<p>👦 <strong>A precise definition.</strong> A pageserver is a <strong>multi-tenant Rust storage service that materializes 8 KB Postgres pages on demand</strong>. It stores no live heap; it stores <strong>immutable layers</strong> in object storage (S3) — <strong>image layers</strong> (a full snapshot of a key range at one LSN) and <strong>delta layers</strong> (the WAL records over a key range across an LSN range) — plus a warm local cache of them. On a <strong><code>GetPage@LSN</code></strong> request it finds the newest image ≤ the requested LSN and <strong>replays the deltas on top</strong> in a sandboxed wal-redo process, returning the page as of <em>any</em> point in history. Because every page is reconstructable from S3-backed layers, the pageserver is a <strong>cache/compute tier over durable storage — not the source of durability</strong> (that's the safekeepers). It <strong>ingests committed WAL from the safekeepers</strong>, and one tenant can be <strong>sharded across many pageservers</strong> to scale.</p>
+<p>🎓 <strong>The technical shape.</strong> Internally the pageserver models storage as a <strong>2D space (Key × LSN)</strong> and keeps a per-timeline index (<code>LayerMap</code>) over image and delta layers, reconstructing pages by replaying WAL over a base image. The rest of this section is that machinery: the layer types, page reconstruction, WAL ingest, compaction and GC, then HA, sharding, and the controller that places shards.</p>
+
+<h3>5.0.2 Who a pageserver interacts with</h3>
+<p>The pageserver sits between the <strong>durability tier</strong> (safekeepers, upstream) and the <strong>compute</strong> (downstream reader), backed by <strong>S3</strong> and orchestrated by the <strong>storage controller</strong>. Six relationships:</p>
+<svg viewBox="0 0 900 470" class="diagram" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="What a pageserver interacts with: safekeepers and storage_broker upstream, compute backend downstream, wal-redo process, S3, storage controller, secondaries and wal2delta">
+  <defs>
+    <marker id="arrPSiC" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L7,3 L0,6 z" fill="#475569"/></marker>
+  </defs>
+  <rect x="365" y="205" width="180" height="60" rx="9" fill="#ffe8d1" stroke="#eb6608" stroke-width="1.8"/>
+  <text x="455" y="230" text-anchor="middle" font-size="12.5" font-weight="700" fill="#b35309">this pageserver</text>
+  <text x="455" y="248" text-anchor="middle" font-size="9.5" fill="#718096">layer engine · Rust</text>
+  <rect x="40" y="40" width="180" height="48" rx="8" fill="#f0fff4" stroke="#38a169"/>
+  <text x="130" y="61" text-anchor="middle" font-size="11" font-weight="700" fill="#276749">👥 safekeepers</text>
+  <text x="130" y="77" text-anchor="middle" font-size="9" fill="#718096">durable WAL · §4</text>
+  <rect x="270" y="40" width="170" height="48" rx="8" fill="#fefce8" stroke="#ca8a04"/>
+  <text x="355" y="61" text-anchor="middle" font-size="11" font-weight="700" fill="#854d0e">📡 storage_broker</text>
+  <text x="355" y="77" text-anchor="middle" font-size="9" fill="#718096">who has the highest LSN?</text>
+  <path d="M220,58 L270,60" stroke="#a0aec0" stroke-dasharray="3 3" marker-end="url(#arrPSiC)"/>
+  <text x="245" y="34" text-anchor="middle" font-size="8.3" fill="#718096">① discover freshest SK</text>
+  <path d="M355,88 L430,205" stroke="#a0aec0" stroke-dasharray="3 3" marker-end="url(#arrPSiC)"/>
+  <path d="M130,88 C130,180 250,215 365,225" stroke="#475569" fill="none" marker-end="url(#arrPSiC)"/>
+  <text x="150" y="150" font-size="8.6" fill="#276749">② stream committed WAL</text>
+  <text x="150" y="163" font-size="8.6" fill="#718096">WalReceiver — exactly one</text>
+  <rect x="40" y="300" width="180" height="60" rx="8" fill="#eef2ff" stroke="#6366f1"/>
+  <text x="130" y="322" text-anchor="middle" font-size="11" font-weight="700" fill="#4338ca">🖥️ compute backend</text>
+  <text x="130" y="337" text-anchor="middle" font-size="8.5" fill="#718096">smgr → communicator</text>
+  <text x="130" y="350" text-anchor="middle" font-size="8.5" fill="#718096">(on shared_buffers+LFC miss)</text>
+  <path d="M220,325 C290,320 320,285 365,250" stroke="#475569" marker-end="url(#arrPSiC)"/>
+  <text x="238" y="300" font-size="8.6" fill="#4338ca">③ GetPage@LSN (8 KB page)</text>
+  <path d="M365,258 C310,300 270,330 220,340" stroke="#475569" marker-end="url(#arrPSiC)"/>
+  <text x="250" y="365" font-size="8.6" fill="#718096">page as of LSN</text>
+  <rect x="360" y="330" width="190" height="60" rx="8" fill="#fff5f5" stroke="#e53e3e"/>
+  <text x="455" y="352" text-anchor="middle" font-size="11" font-weight="700" fill="#9b2c2c">🧬 wal-redo process</text>
+  <text x="455" y="367" text-anchor="middle" font-size="8.5" fill="#718096">postgres --wal-redo</text>
+  <text x="455" y="380" text-anchor="middle" font-size="8.5" fill="#718096">one per tenant · seccomp</text>
+  <path d="M455,265 L455,330" stroke="#475569" marker-end="url(#arrPSiC)"/>
+  <text x="463" y="300" font-size="8.6" fill="#9b2c2c">④ base image + replay deltas</text>
+  <rect x="700" y="205" width="170" height="60" rx="8" fill="#f0fdf4" stroke="#16a34a"/>
+  <text x="785" y="227" text-anchor="middle" font-size="11" font-weight="700" fill="#14532d">🪣 S3 / object storage</text>
+  <text x="785" y="242" text-anchor="middle" font-size="8.3" fill="#718096">layers · index_part.json</text>
+  <text x="785" y="254" text-anchor="middle" font-size="8.3" fill="#718096">· heatmap</text>
+  <path d="M545,228 L700,230" stroke="#475569" marker-end="url(#arrPSiC)"/>
+  <path d="M700,244 L545,246" stroke="#475569" marker-end="url(#arrPSiC)"/>
+  <text x="622" y="220" text-anchor="middle" font-size="8.6" fill="#14532d">⑤ upload / download</text>
+  <rect x="680" y="40" width="190" height="60" rx="8" fill="#faf5ff" stroke="#9333ea"/>
+  <text x="775" y="62" text-anchor="middle" font-size="11" font-weight="700" fill="#6b21a8">🎛️ storage controller</text>
+  <text x="775" y="77" text-anchor="middle" font-size="8.3" fill="#718096">attach + generation · schedule</text>
+  <text x="775" y="89" text-anchor="middle" font-size="8.3" fill="#718096">promote 2ndary · notify-attach</text>
+  <path d="M775,100 C740,150 620,195 545,213" stroke="#475569" marker-end="url(#arrPSiC)"/>
+  <text x="640" y="130" text-anchor="middle" font-size="8.6" fill="#6b21a8">⑥ control decisions (no page data)</text>
+  <rect x="680" y="330" width="190" height="60" rx="8" fill="#fffbeb" stroke="#d97706" stroke-dasharray="5 4"/>
+  <text x="775" y="352" text-anchor="middle" font-size="11" font-weight="700" fill="#92400e">🌡️ secondary PS / shards</text>
+  <text x="775" y="367" text-anchor="middle" font-size="8.3" fill="#718096">prefetch heatmap layers</text>
+  <text x="775" y="380" text-anchor="middle" font-size="8.3" fill="#718096">warm standby · §5.1/§5.2</text>
+  <path d="M545,255 C620,290 660,320 700,345" stroke="#a0aec0" stroke-dasharray="3 3" marker-end="url(#arrPSiC)"/>
+  <text x="600" y="315" text-anchor="middle" font-size="8.6" fill="#92400e">heatmap (via S3)</text>
+  <rect x="40" y="410" width="290" height="46" rx="8" fill="#ecfeff" stroke="#0891b2" stroke-dasharray="5 4"/>
+  <text x="185" y="431" text-anchor="middle" font-size="10.5" font-weight="700" fill="#155e75">🔀 wal2delta / transcoding — ⑦ [LTAP]</text>
+  <text x="185" y="446" text-anchor="middle" font-size="8.3" fill="#718096">row pages → columnar Parquet (Delta/Iceberg)</text>
+  <path d="M365,250 C280,320 230,370 210,410" stroke="#a0aec0" stroke-dasharray="3 3" marker-end="url(#arrPSiC)"/>
+</svg>
+<p class="dgm-cap">Solid arrows = WAL/page data on the hot path; dashed = discovery, control, warm-standby prefetch, or the optional LTAP lake path. The pageserver <em>consumes</em> already-committed WAL — it never joins the write quorum.</p>
+<ol>
+  <li><strong>The safekeepers (upstream) + the <code>storage_broker</code>.</strong> The pageserver's <code>WalReceiver</code> keeps <strong>exactly one</strong> active streaming connection to a safekeeper, chosen by asking the <strong><code>storage_broker</code></strong> which node has the <strong>highest LSN</strong> (§4.3). It never participates in the write quorum — it is a <em>consumer</em> of already-committed WAL, which it decodes (<code>WalIngest</code>/<code>DatadirModification</code>) into its open <code>InMemoryLayer</code>.</li>
+  <li><strong>The compute backend (downstream reader).</strong> On a <code>shared_buffers</code> + LFC miss, the compute's storage manager (<code>smgr</code> → communicator) sends a <strong><code>GetPage@LSN</code></strong> request for a single 8 KB page as of a given LSN; the pageserver reconstructs it and returns it. This is the hot read path (Part 16 §16.2, Part 6).</li>
+  <li><strong>The wal-redo process.</strong> To materialize a page, the pageserver replays WAL records onto a base image inside a sandboxed <strong><code>postgres --wal-redo</code></strong> process (<code>PostgresRedoManager</code>, seccomp, <strong>one per tenant</strong>) — the same redo code Postgres uses in crash recovery, reused as a pure function.</li>
+  <li><strong>S3 / object storage.</strong> The <strong>authoritative home</strong> of every layer. The pageserver uploads frozen L0 deltas and compacted image/L1 layers (<code>RemoteTimelineClient</code>), and records them in <strong><code>index_part.json</code></strong> — the manifest of what is remote state. It downloads layers on cache misses. Every layer PUT carries a <strong>generation</strong> suffix so a zombie node can't corrupt current state (§5.1).</li>
+  <li><strong>The storage controller (control plane).</strong> It <strong>attaches</strong> the tenant shard to this pageserver with a <strong>generation</strong> (the fencing token), <strong>schedules</strong> shards across nodes (AZ-aware), keeps <strong>secondaries</strong> warm, promotes one on failure, and fires the <strong><code>notify-attach</code></strong> hook so the compute reconnects (§5.1, §5.3). It carries control decisions, never page data.</li>
+  <li><strong>Secondary pageservers / other shards.</strong> The attached node publishes a <strong>heatmap</strong> (its hottest layers) to S3; <strong>secondary</strong> locations pre-fetch those layers to stay warm for fast failover (§5.1). A large tenant is split into <strong>shards</strong>, each an independent timeline on a (possibly) different pageserver (§5.2); the compute routes each key to the shard that owns it.</li>
+  <li><strong><code>wal2delta</code> / transcoding (LTAP, optional).</strong> For the lake path, a separate process turns row-oriented Postgres pages into <strong>compressed columnar Parquet</strong> (Delta/Iceberg) on object storage — async and isolated from the OLTP read path (Part 8 §2/§3).</li>
+</ol>
+
+<h3>How it works internally — the layer engine</h3>
 <p>It turns the WAL into pages. Central concept: the <strong>2D space of (Key × LSN)</strong>, where <code>Key</code> addresses a page (relation + block) and <code>Lsn</code> the point in the WAL.</p>
 <h3>Layer types (<code>pageserver/src/tenant/storage_layer/</code>)</h3>
 <ul>
@@ -2992,6 +3158,7 @@ READ (get page)
 
 <h2 id="p5-16">16. <code>compute_manager</code>: how the endpoint is assigned to the branch</h2>
 <p>When a branch appears, a <strong>compute</strong> is needed to serve it. It's orchestrated by <code>hadron/compute_manager/</code> through <strong>reconcilers</strong> (declarative loop: brings the real state to the desired one).</p>
+<blockquote><strong>This is the code proof that each branch runs its own independent compute</strong> (see the product-level clarification in Part 4 §6): the <code>ComputeReconciler</code> provisions a <strong>separate Kubernetes Pod/ReplicaSet</strong> — a real, isolated PostgreSQL process with its own CPU/RAM and identity — per served branch. A branch is a <em>storage timeline</em>; the compute is a <em>distinct process</em> bound to it, not a view inside the parent's compute.</blockquote>
 
 <svg viewBox="0 0 880 330" class="diagram" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="compute_manager assigns the endpoint to the branch">
   <defs>
