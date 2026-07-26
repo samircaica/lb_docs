@@ -201,7 +201,7 @@
 <header>
   <h1>🐘 PostgreSQL y Lakebase explicados</h1>
   <p>De niño de 5 años a profesor de mayores — aprende primero PostgreSQL, luego Databricks Lakebase.</p>
-  <p style="font-size:.82rem;opacity:.6;margin:.5rem 0 0">📅 Generado: 2026-07-24 23:25 UTC</p>
+  <p style="font-size:.82rem;opacity:.6;margin:.5rem 0 0">📅 Generado: 2026-07-26 22:27 UTC</p>
 </header>
 
 <section class="howto">
@@ -5945,6 +5945,7 @@ SELECT * FROM information_schema.role_table_grants WHERE table_name = 'orders';<
 </svg>
 
 <h2 id="p14-2">14.2. 🐘 Usar un driver de PostgreSQL</h2>
+<blockquote>🔑 <strong>Nota sobre OAuth.</strong> Aquí ves OAuth desde la perspectiva del que se <em>conecta</em> (el token como contraseña de la conexión y cómo refrescarlo en un pool). Para ver cómo se <em>valida</em> ese mismo token por dentro —la doble verificación en el proxy y en el compute, la firma RS256 y la extensión <code>databricks_auth</code>— ve a la <strong>Parte 16 §16.4</strong>.</blockquote>
 <p><strong>Vista general de la conexión PostgreSQL.</strong> Un driver habla el <strong>protocolo de cable frontend/backend de Postgres</strong> sobre un socket TCP. El ciclo de vida (detallado en la Parte 2 §4 y la Parte 6):</p>
 <ol>
   <li><strong>TCP + TLS.</strong> El cliente abre un socket al host del endpoint en el <strong>:5432</strong> y negocia <strong>SSL</strong> (<code>sslmode=require</code> como mínimo). En Lakebase la conexión primero llega al <strong>proxy</strong> (<code>pg_sni_router</code>), que enruta por <strong>SNI</strong> al compute correcto y, si estaba escalado a cero, lo <strong>despierta</strong> (Parte 5 §19).</li>
@@ -6397,6 +6398,7 @@ curl -X DELETE -H "Authorization: Bearer $DBX_OAUTH_TOKEN" "$REST_ENDPOINT/publi
 <p><strong>Niveles de durabilidad:</strong> (1) quórum en <strong>≥ 2 safekeepers</strong> al commit → sobrevive una caída inmediata del compute; (2) disco local del pageserver; (3) <strong>S3</strong>. Al reiniciar, el compute <strong>no necesita replay de WAL</strong> — reconstruye cada página desde el pageserver bajo demanda. El lag de réplica aparece como <code>replication_delay_bytes</code> / <code>replication_delay_seconds</code> (UI, solo endpoints de réplica).</p>
 
 <h2 id="p16-4">16.4. 🔑 Autenticación — la doble verificación (proxy <em>y</em> compute)</h2>
+<blockquote>🔌 <strong>Nota sobre OAuth.</strong> Esta sección explica cómo se <em>valida</em> el token OAuth por dentro. Para el lado del que se <em>conecta</em> —cómo pasar el token como contraseña con un driver o como header <code>Bearer</code> en la Data API, y cómo refrescarlo en un pool— ve a la <strong>Parte 14 §14.2 y §14.3</strong>.</blockquote>
 <p>Toda conexión se autentica <strong>antes de que corra cualquier consulta</strong> — y en <strong>V2, dos veces</strong>: una en el <code>lakebase-proxy</code> y otra en el pod de compute, que re-valida la credencial reenviada de forma independiente.</p>
 <table>
   <tr><th>Método</th><th>Cómo se verifica</th><th>Notas</th></tr>
