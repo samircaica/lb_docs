@@ -205,7 +205,7 @@
 <header>
   <h1>🐘 PostgreSQL &amp; Lakebase explained</h1>
   <p>From a 5-year-old to an advanced professor — learn PostgreSQL first, then Databricks Lakebase.</p>
-  <p style="font-size:.82rem;opacity:.6;margin:.5rem 0 0">📅 Generated: 2026-07-27 11:39 UTC</p>
+  <p style="font-size:.82rem;opacity:.6;margin:.5rem 0 0">📅 Generated: 2026-07-27 12:50 UTC</p>
 </header>
 
 <section class="howto">
@@ -6289,6 +6289,15 @@ curl -X DELETE -H "Authorization: Bearer $DBX_OAUTH_TOKEN" "$REST_ENDPOINT/publi
   <path d="M600,126 L600,144" stroke="#3182ce" stroke-width="1.4" marker-end="url(#ha-a)"/>
 </svg>
 <p class="dgm-cap">HA keeps compute available across AZs; PITR rewinds to any LSN within the retention window — both lean on the same durable, LSN-addressed storage.</p>
+
+<blockquote>
+<p>🕰️ <strong>Classic PostgreSQL PITR vs. the Lakebase model.</strong> The term "PITR" comes from stock Postgres, but the mechanism is very different — it's worth contrasting them because it explains why in Lakebase a restore is <em>instant</em> and costs no extra storage.</p>
+<ul>
+  <li><strong>Classic PITR (self-managed Postgres).</strong> You set up two pieces: (1) a periodic physical <strong>base backup</strong> (e.g. with <code>pg_basebackup</code>) and (2) <strong>continuous WAL archiving</strong> to a separate store (<code>archive_mode=on</code> + <code>archive_command</code>). To recover, you <strong>restore the base backup and then <em>replay</em> the WAL</strong> forward up to a target you choose (<code>recovery_target_time</code>, <code>recovery_target_lsn</code>, …). In other words: <em>copy a full snapshot + replay hours of WAL</em> — this can take minutes to hours, uses space proportional to each backup, and the most recent recoverable point is bounded by how often you archive.</li>
+  <li><strong>The Lakebase model (LSN branching).</strong> There are no base backups or <code>archive_command</code> to manage. Because storage is <strong>LSN-addressed</strong> and <strong>copy-on-write</strong> (Part 4, Part 8), the WAL history <em>already is</em> the full timeline. Restoring to a past moment = <strong>creating a branch that points at that LSN</strong> and attaching compute to it — <strong>no data is copied</strong>, it's effectively instant, and common pages are shared across branches (which is why a restore doesn't inflate your quota). What was "backup + replay" in classic Postgres is just a pointer into an immutable history that is already persisted.</li>
+</ul>
+<p><strong>The mental equivalence:</strong> <em>"base backup + WAL replay up to <code>recovery_target_time</code>"</em> (classic) ⇒ <em>"branch at <code>LSN_t</code> within the retention window"</em> (Lakebase). The limit on "how far back you can go" is no longer "how many backups I keep" but the <strong>history/retention window</strong> (~30 days v2, ~35 v1), after which <strong>GC</strong> reclaims the older layers.</p>
+</blockquote>
 
 <h2 id="p15-5">15.5. 🔐 Security &amp; the managed-privilege model</h2>
 <ul>
