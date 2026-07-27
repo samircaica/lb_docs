@@ -201,7 +201,7 @@
 <header>
   <h1>🐘 PostgreSQL y Lakebase explicados</h1>
   <p>De niño de 5 años a profesor de mayores — aprende primero PostgreSQL, luego Databricks Lakebase.</p>
-  <p style="font-size:.82rem;opacity:.6;margin:.5rem 0 0">📅 Generado: 2026-07-26 22:27 UTC</p>
+  <p style="font-size:.82rem;opacity:.6;margin:.5rem 0 0">📅 Generado: 2026-07-27 11:39 UTC</p>
 </header>
 
 <section class="howto">
@@ -2598,6 +2598,15 @@ cred = w.database.generate_database_credential(
 <p>🎓 <strong>La forma técnica.</strong> El nivel es un protocolo estilo Paxos <strong>proposer/acceptor</strong> repartido entre el <strong>proposer</strong> (el líder, corriendo como el background worker <code>walproposer</code> dentro del cómputo, C) y los <strong>acceptors</strong> (los safekeepers, Rust). Una timeline se replica en el conjunto de safekeepers (<strong>típicamente 3</strong>); el WAL es durable en el instante en que una <strong>mayoría</strong> lo ha flusheado — esto reemplaza al <code>fsync</code> local del Postgres estándar.</p>
 
 <h3>4.2 Cómo funciona por dentro — el proposer: <code>walproposer.c</code> / <code>walproposer.h</code> (cómputo)</h3>
+<blockquote>
+<p>🧠 <strong>Primero, ¿qué es Paxos? (el algoritmo, en abstracto).</strong> Paxos es un algoritmo de <em>consenso</em>: un conjunto de nodos que fallan de forma independiente y se comunican por una red poco fiable tienen que ponerse de acuerdo en <strong>un único valor</strong>, y no contradecirse nunca — aunque algunos nodos se caigan, se reinicien o lleguen mensajes tarde o duplicados. Lamport lo formuló en <em>"The Part-Time Parliament"</em> (1998). Hay tres <strong>roles</strong>: los <strong>proposers</strong> proponen valores, los <strong>acceptors</strong> votan y son la memoria del sistema, y los <strong>learners</strong> observan qué se decidió. Funciona en <strong>dos fases</strong>:</p>
+<ol>
+  <li><strong>Prepare / Promise (elección).</strong> Un proposer elige un número de propuesta <code>n</code> (estrictamente creciente, único) y pregunta a los acceptors: "¿me prometéis que no aceptaréis nada con número &lt; <code>n</code>?". Un acceptor responde con una <strong>promesa</strong> solo si <code>n</code> es mayor que cualquiera que haya visto, y de paso le cuenta el valor de mayor número que ya haya aceptado. Al prometer, <strong>persiste</strong> ese número para no romper la promesa tras un reinicio.</li>
+  <li><strong>Accept / Accepted (replicación).</strong> Si el proposer recibe promesas de una <strong>mayoría</strong> (un <em>quórum</em>), manda "acepta el valor <code>v</code> con número <code>n</code>". Pero si algún acceptor ya había aceptado algo, el proposer <strong>está obligado a reproponer ese valor</strong>, no el suyo. Un valor está <strong>decidido</strong> en cuanto una <strong>mayoría</strong> lo acepta.</li>
+</ol>
+<p>Dos ideas hacen que sea correcto: <strong>(a) mayorías que se solapan</strong> — dos quórums cualesquiera comparten al menos un nodo, así que un valor ya decidido siempre es "visto" por la siguiente elección y no puede perderse; y <strong>(b) los números de propuesta ordenan el tiempo</strong> — un proposer viejo con número menor es ignorado, lo que evita que dos líderes escriban valores en conflicto (<em>split-brain</em>). El resultado: <strong>como mucho un valor llega a decidirse</strong>, aunque haya varios proposers compitiendo.</p>
+<p><strong>Cómo mapea esto a Lakebase (el resto de §4.2).</strong> El <strong>proposer</strong> es el <code>walproposer</code> dentro del cómputo; los <strong>acceptors</strong> son los 3 safekeepers; el pageserver es un <strong>learner</strong> que consume el WAL decidido. El "número de propuesta" es el <strong>término</strong> (<code>term</code>), y el "valor" que se acuerda no es un dato suelto sino la <strong>secuencia de registros de WAL</strong>. La fase Prepare/Promise es la <strong>elección de líder</strong> (<code>VoteRequest</code> / <code>VoteResponse</code>), y la fase Accept/Accepted es el streaming continuo de WAL (<code>AppendRequest</code> / <code>AppendResponse</code>); un <code>COMMIT</code> retorna cuando un <strong>quórum (≥ 2 de 3)</strong> ha hecho <code>fsync</code> del WAL. Ten en cuenta que no es Paxos de libro de texto sino una variante estilo Raft/Paxos afinada para <em>replicar un log</em> (una sola línea de WAL en vez de decidir valores independientes) — de ahí los detalles de <code>TermHistory</code> y truncado que verás abajo.</p>
+</blockquote>
 <ul>
   <li>Struct central <code>WalProposer</code> (máquina de estados del protocolo) y <code>Safekeeper</code> (un descriptor de conexión por acceptor); <code>WalProposerConfig</code>.</li>
   <li>Funciones: <code>WalProposerCreate()</code>, <code>WalProposerStart()</code>, <code>WalProposerBroadcast()</code>, <code>WalProposerPoll()</code>.</li>

@@ -205,7 +205,7 @@
 <header>
   <h1>🐘 PostgreSQL &amp; Lakebase explained</h1>
   <p>From a 5-year-old to an advanced professor — learn PostgreSQL first, then Databricks Lakebase.</p>
-  <p style="font-size:.82rem;opacity:.6;margin:.5rem 0 0">📅 Generated: 2026-07-26 22:27 UTC</p>
+  <p style="font-size:.82rem;opacity:.6;margin:.5rem 0 0">📅 Generated: 2026-07-27 11:39 UTC</p>
 </header>
 
 <section class="howto">
@@ -2649,6 +2649,15 @@ cred = w.database.generate_database_credential(
 <p>🎓 <strong>The technical shape.</strong> The tier is a Paxos-style <strong>proposer/acceptor</strong> protocol split between the <strong>proposer</strong> (the leader, running as the <code>walproposer</code> background worker inside the compute, C) and the <strong>acceptors</strong> (the safekeepers, Rust). A timeline is replicated across the set of safekeepers (<strong>typically 3</strong>); the WAL is durable the instant a <strong>majority</strong> has flushed it — this replaces the local <code>fsync</code> of stock Postgres.</p>
 
 <h3>4.2 How it works internally — the proposer: <code>walproposer.c</code> / <code>walproposer.h</code> (compute)</h3>
+<blockquote>
+<p>🧠 <strong>First, what is Paxos? (the algorithm, in the abstract).</strong> Paxos is a <em>consensus</em> algorithm: a set of nodes that fail independently and talk over an unreliable network have to agree on <strong>a single value</strong> and never contradict each other — even if some nodes crash, restart, or messages arrive late or duplicated. Lamport described it in <em>"The Part-Time Parliament"</em> (1998). There are three <strong>roles</strong>: <strong>proposers</strong> propose values, <strong>acceptors</strong> vote and are the system's memory, and <strong>learners</strong> observe what was decided. It works in <strong>two phases</strong>:</p>
+<ol>
+  <li><strong>Prepare / Promise (election).</strong> A proposer picks a proposal number <code>n</code> (strictly increasing, unique) and asks the acceptors: "will you promise not to accept anything numbered &lt; <code>n</code>?". An acceptor answers with a <strong>promise</strong> only if <code>n</code> is higher than any it has seen, and tells the proposer the highest-numbered value it has already accepted. On promising, it <strong>persists</strong> that number so it can't break the promise after a restart.</li>
+  <li><strong>Accept / Accepted (replication).</strong> If the proposer gets promises from a <strong>majority</strong> (a <em>quorum</em>), it sends "accept value <code>v</code> with number <code>n</code>". But if any acceptor had already accepted something, the proposer is <strong>obliged to re-propose that value</strong>, not its own. A value is <strong>decided</strong> as soon as a <strong>majority</strong> accepts it.</li>
+</ol>
+<p>Two ideas make it correct: <strong>(a) overlapping majorities</strong> — any two quorums share at least one node, so an already-decided value is always "seen" by the next election and can't be lost; and <strong>(b) proposal numbers order time</strong> — an old proposer with a lower number is ignored, which stops two leaders from writing conflicting values (<em>split-brain</em>). The result: <strong>at most one value is ever decided</strong>, even with several proposers competing.</p>
+<p><strong>How this maps to Lakebase (the rest of §4.2).</strong> The <strong>proposer</strong> is the <code>walproposer</code> inside compute; the <strong>acceptors</strong> are the 3 safekeepers; the pageserver is a <strong>learner</strong> that consumes the decided WAL. The "proposal number" is the <strong>term</strong> (<code>term</code>), and the "value" being agreed isn't a single datum but the <strong>sequence of WAL records</strong>. The Prepare/Promise phase is <strong>leader election</strong> (<code>VoteRequest</code> / <code>VoteResponse</code>), and the Accept/Accepted phase is the continuous WAL streaming (<code>AppendRequest</code> / <code>AppendResponse</code>); a <code>COMMIT</code> returns once a <strong>quorum (≥ 2 of 3)</strong> has <code>fsync</code>'d the WAL. Note this isn't textbook Paxos but a Raft/Paxos-style variant tuned for <em>replicating a log</em> (a single line of WAL rather than deciding independent values) — hence the <code>TermHistory</code> and truncation details you'll see below.</p>
+</blockquote>
 <ul>
   <li>Central struct <code>WalProposer</code> (the protocol state machine) and <code>Safekeeper</code> (one connection descriptor per acceptor); <code>WalProposerConfig</code>.</li>
   <li>Functions: <code>WalProposerCreate()</code>, <code>WalProposerStart()</code>, <code>WalProposerBroadcast()</code>, <code>WalProposerPoll()</code>.</li>
